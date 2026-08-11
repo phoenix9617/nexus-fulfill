@@ -1,142 +1,119 @@
-// app/services/shopifyProductSync.server.ts
+// app/services/cjTrackingSync.server.ts
 import db from "../db.server";
-import { evaluateAutoSurgeForShop } from "./surge.server";
+import { getCJTracking } from "./cj.server";
 
-const PRODUCTS_QUERY = `#graphql
-  query getProducts($first: Int!, $after: String) {
-    products(first: $first, after: $after) {
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-      nodes {
-        id
-        title
-        variants(first: 50) {
-          nodes {
-            id
-            title
-            price
-            sku
-          }
-        }
-      }
-    }
-  }
-`;
+interface SyncTrackingOptions {
+  admin?: any;
+  shop?: string;
+}
 
 /**
- * Helper to execute GraphQL queries with exponential backoff when Shopify rate-limits (THROTTLED)
+ * Syncs CJ Dropshipping tracking numbers and updates fulfillment status in Shopify / Database
  */
-async function executeGqlWithRetry(
-  admin: any,
-  query: string,
-  variables: Record<string, any>,
-  retries = 3,
-  delayMs = 1000
-): Promise<any> {
-  try {
-    const response = await admin.graphql(query, { variables });
-    const json = await response.json();
+export async function syncCJTrackingOrders(options: SyncTrackingOptions = {}) {
+  const { admin, shop } = options;
 
-    if (json.errors && json.errors.some((e: any) => e.message?.includes("THROTTLED"))) {
-      if (retries > 0) {
-        console.warn(`[Shopify Sync] Rate limit hit. Retrying in ${delayMs}ms...`);
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-        return executeGqlWithRetry(admin, query, variables, retries - 1, delayMs * 2);
+  console.log(`[CJ Tracking Sync] Starting tracking sync${shop ? ` for ${shop}` : ""}...`);
+
+  let updatedCount = 0;
+
+  try {
+    // 1. Fetch orders from DB that have a CJ order ID but are missing tracking or unfulfilled
+    const pendingOrders = await db.order.findMany({
+      where: {
+        ...(shop ? { shop } : {}),
+        cjOrderId: { not: null },
+        trackingNumber: null,
+      },
+      take: 50,
+    });
+
+    for (const order of pendingOrders) {
+      if (!order.cjOrderId) continue;
+
+      try {
+        // 2. Query CJ API for tracking details
+        const trackingData = await getCJTracking(order.cjOrderId);
+
+        if (trackingData && trackingData.trackingNumber) {
+          // 3. Update order record in database
+          await db.order.update({
+            where: { id: order.id },
+            data: {
+              trackingNumber: trackingData.trackingNumber,
+              carrier: trackingData.carrier || "CJ Logistics",
+              fulfillmentStatus: "FULFILLED",
+            },
+          });
+
+          // 4. If Shopify admin client is provided, fulfill the order in Shopify
+          if (admin && order.shopifyOrderId) {
+            await fulfillShopifyOrder(admin, order.shopifyOrderId, {
+              trackingNumber: trackingData.trackingNumber,
+              carrier: trackingData.carrier || "CJ Logistics",
+            });
+          }
+
+          updatedCount++;
+        }
+      } catch (orderError) {
+        console.error(`[CJ Tracking Sync] Error syncing CJ Order ${order.cjOrderId}:`, orderError);
       }
     }
 
-    return json;
+    console.log(`[CJ Tracking Sync] Complete. Updated ${updatedCount} orders.`);
+    return { success: true, updatedCount };
   } catch (error) {
-    if (retries > 0) {
-      console.warn(`[Shopify Sync] Network exception. Retrying in ${delayMs}ms...`, error);
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-      return executeGqlWithRetry(admin, query, variables, retries - 1, delayMs * 2);
-    }
-    throw error;
+    console.error("[CJ Tracking Sync] Global sync error:", error);
+    return { success: false, updatedCount, error: (error as Error).message };
   }
 }
 
-export async function syncShopifyProducts({
-  admin,
-  shop,
-}: {
-  admin: any;
-  shop: string;
-}) {
-  let hasNextPage = true;
-  let cursor: string | null = null;
-  let importedCount = 0;
-
-  // Fetch store auto-surge settings defaults
-  const settings = await db.surgeSetting.findUnique({
-    where: { shop },
-  });
-
-  const defaultThreshold = settings?.autoSalesThreshold ?? 10;
-  const defaultResetDays = settings?.autoResetDays ?? 7;
-
-  while (hasNextPage) {
-    const json = await executeGqlWithRetry(admin, PRODUCTS_QUERY, {
-      first: 50,
-      after: cursor,
-    });
-
-    const productsData = json.data?.products;
-
-    if (!productsData || !productsData.nodes) {
-      console.warn("[Shopify Sync] No product data returned or sync completed early.");
-      break;
-    }
-
-    for (const product of productsData.nodes) {
-      const productId = product.id;
-
-      for (const variant of product.variants.nodes) {
-        const variantId = variant.id;
-        const price = parseFloat(variant.price || "0");
-        const variantTitle =
-          variant.title === "Default Title"
-            ? product.title
-            : `${product.title} - ${variant.title}`;
-
-        // Upsert product variants into database without overwriting active surge states
-        await db.surgedProduct.upsert({
-          where: { shopifyVariantId: variantId },
-          update: {
-            title: variantTitle,
-            sku: variant.sku || "",
-          },
-          create: {
-            shop,
-            shopifyProductId: productId,
-            shopifyVariantId: variantId,
-            title: variantTitle,
-            sku: variant.sku || "",
-            originalPrice: price,
-            currentPrice: price,
-            salesCount: 0,
-            surgeStatus: "NORMAL",
-            autoSurgeThreshold: defaultThreshold,
-            resetDays: defaultResetDays,
-          },
-        });
-
-        importedCount++;
+/**
+ * Helper to fulfill an order in Shopify via GraphQL API
+ */
+async function fulfillShopifyOrder(
+  admin: any,
+  shopifyOrderId: string,
+  trackingInfo: { trackingNumber: string; carrier: string }
+) {
+  const FULFILLMENT_MUTATION = `#graphql
+    mutation fulfillmentCreateV2($fulfillment: FulfillmentV2Input!) {
+      fulfillmentCreateV2(fulfillment: $fulfillment) {
+        fulfillment {
+          id
+          status
+        }
+        userErrors {
+          field
+          message
+        }
       }
     }
+  `;
 
-    hasNextPage = productsData.pageInfo.hasNextPage;
-    cursor = productsData.pageInfo.endCursor;
-  }
-
-  // Run auto-surge logic immediately after products are synced
   try {
-    await evaluateAutoSurgeForShop({ admin, shop });
-  } catch (error) {
-    console.error("[Shopify Sync] Failed to evaluate auto surge after sync:", error);
-  }
+    const response = await admin.graphql(FULFILLMENT_MUTATION, {
+      variables: {
+        fulfillment: {
+          lineItemsByFulfillmentOrder: [
+            {
+              fulfillmentOrderId: shopifyOrderId,
+            },
+          ],
+          trackingInfo: {
+            company: trackingInfo.carrier,
+            number: trackingInfo.trackingNumber,
+          },
+        },
+      },
+    });
 
-  return { success: true, count: importedCount };
+    const json = await response.json();
+    if (json.data?.fulfillmentCreateV2?.userErrors?.length > 0) {
+      console.warn("[Shopify Fulfillment] User errors:", json.data.fulfillmentCreateV2.userErrors);
+    }
+  } catch (err) {
+    console.error("[Shopify Fulfillment] Exception while fulfilling order:", err);
+  }
 }
