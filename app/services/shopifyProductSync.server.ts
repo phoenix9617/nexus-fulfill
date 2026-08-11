@@ -1,6 +1,82 @@
-// app/services/cjTrackingSync.server.ts
 import db from "../db.server";
 import { getCJTracking } from "./cj.server";
+
+// --- Shopify Product Sync ---
+
+interface SyncShopifyProductsOptions {
+  admin: any;
+  shop: string;
+}
+
+/**
+ * Syncs Shopify products & variants into the surgedProduct table
+ */
+export async function syncShopifyProducts({ admin, shop }: SyncShopifyProductsOptions) {
+  const response = await admin.graphql(
+    `#graphql
+    query getProducts {
+      products(first: 250) {
+        edges {
+          node {
+            id
+            title
+            variants(first: 250) {
+              edges {
+                node {
+                  id
+                  title
+                  sku
+                  price
+                }
+              }
+            }
+          }
+        }
+      }
+    }`
+  );
+
+  const responseJson = await response.json();
+  const products = responseJson?.data?.products?.edges || [];
+  let syncedCount = 0;
+
+  for (const productEdge of products) {
+    const product = productEdge.node;
+
+    for (const variantEdge of product.variants.edges) {
+      const variant = variantEdge.node;
+      const currentPrice = parseFloat(variant.price) || 0;
+
+      await db.surgedProduct.upsert({
+        where: {
+          shopifyVariantId: variant.id,
+        },
+        update: {
+          title: product.title,
+          sku: variant.sku || "N/A",
+        },
+        create: {
+          shop,
+          shopifyProductId: product.id,
+          shopifyVariantId: variant.id,
+          title: product.title,
+          sku: variant.sku || "N/A",
+          originalPrice: currentPrice,
+          currentPrice: currentPrice,
+          surgeStatus: "NORMAL",
+          surgePercentage: 0,
+          salesCount: 0,
+        },
+      });
+
+      syncedCount++;
+    }
+  }
+
+  return { count: syncedCount };
+}
+
+// --- CJ Tracking Sync ---
 
 interface SyncTrackingOptions {
   admin?: any;
@@ -77,28 +153,66 @@ async function fulfillShopifyOrder(
   shopifyOrderId: string,
   trackingInfo: { trackingNumber: string; carrier: string }
 ) {
-  const FULFILLMENT_MUTATION = `#graphql
-    mutation fulfillmentCreateV2($fulfillment: FulfillmentV2Input!) {
-      fulfillmentCreateV2(fulfillment: $fulfillment) {
-        fulfillment {
-          id
-          status
+  try {
+    let targetFulfillmentOrderId = shopifyOrderId;
+
+    // Standard Shopify Order IDs need to be converted to FulfillmentOrder IDs
+    if (!shopifyOrderId.includes("FulfillmentOrder")) {
+      const formattedOrderId = shopifyOrderId.startsWith("gid://")
+        ? shopifyOrderId
+        : `gid://shopify/Order/${shopifyOrderId}`;
+
+      const GET_FULFILLMENT_ORDERS_QUERY = `#graphql
+        query getFulfillmentOrders($orderId: ID!) {
+          order(id: $orderId) {
+            fulfillmentOrders(first: 5) {
+              nodes {
+                id
+                status
+              }
+            }
+          }
         }
-        userErrors {
-          field
-          message
+      `;
+
+      const foResponse = await admin.graphql(GET_FULFILLMENT_ORDERS_QUERY, {
+        variables: { orderId: formattedOrderId },
+      });
+      const foJson = await foResponse.json();
+
+      const openFulfillmentOrder = foJson.data?.order?.fulfillmentOrders?.nodes?.find(
+        (fo: any) => fo.status === "OPEN" || fo.status === "IN_PROGRESS"
+      );
+
+      if (!openFulfillmentOrder) {
+        console.warn(`[Shopify Fulfillment] No open fulfillment order found for ${shopifyOrderId}`);
+        return;
+      }
+
+      targetFulfillmentOrderId = openFulfillmentOrder.id;
+    }
+
+    const FULFILLMENT_MUTATION = `#graphql
+      mutation fulfillmentCreateV2($fulfillment: FulfillmentV2Input!) {
+        fulfillmentCreateV2(fulfillment: $fulfillment) {
+          fulfillment {
+            id
+            status
+          }
+          userErrors {
+            field
+            message
+          }
         }
       }
-    }
-  `;
+    `;
 
-  try {
     const response = await admin.graphql(FULFILLMENT_MUTATION, {
       variables: {
         fulfillment: {
           lineItemsByFulfillmentOrder: [
             {
-              fulfillmentOrderId: shopifyOrderId,
+              fulfillmentOrderId: targetFulfillmentOrderId,
             },
           ],
           trackingInfo: {
@@ -117,3 +231,6 @@ async function fulfillShopifyOrder(
     console.error("[Shopify Fulfillment] Exception while fulfilling order:", err);
   }
 }
+
+// Export aliases for flexible importing across routes
+export { syncCJTrackingOrders as syncCJTracking, syncCJTrackingOrders as syncTracking };
