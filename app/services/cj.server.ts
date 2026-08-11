@@ -498,7 +498,7 @@ export async function createCJOrder(params: CJCreateOrderParams, apiKeyOrToken?:
 }
 
 /**
- * Fetch Tracking Info for a CJ Order
+ * Fetch Raw Tracking Info for a CJ Order
  */
 export async function getCJTrackingInfo(cjOrderId: string, apiKeyOrToken?: string) {
   const token = await getCJAccessToken(apiKeyOrToken);
@@ -532,3 +532,20 @@ export async function getCJTrackingInfo(cjOrderId: string, apiKeyOrToken?: strin
 
   return null;
 }
+
+/**
+ * Fetch and normalize tracking information for a CJ Order
+ */
+export async function getCJTracking(cjOrderId: string, apiKeyOrToken?: string) {
+  const raw = await getCJTrackingInfo(cjOrderId, apiKeyOrToken);
+  if (!raw) return null;
+
+  return {
+    trackingNumber: raw.trackingNumber || raw.trackNumber || raw.logisticTrackNo || null,
+    carrier: raw.carrier || raw.logisticName || raw.logisticCompany || "CJ Logistics",
+    raw,
+  };
+}
+
+// Casing alias
+export const getCjTracking = getCJTracking;
