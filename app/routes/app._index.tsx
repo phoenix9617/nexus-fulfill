@@ -38,17 +38,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   });
 
   // 2. Fetch live metrics from Prisma models
-  // Mapped products count (or product mappings)
   const mappedProductsCount = await db.surgedProduct.count({
     where: { shop },
   });
 
-  // Rerouted or failed orders count
   const reroutedOrdersCount = await db.fulfilledOrder.count({
     where: { shop, status: "REROUTED" },
   });
 
-  // Active surge interventions count
   const surgeInterventionsCount = await db.surgedProduct.count({
     where: { shop, surgeStatus: "AUTO_SURGED" },
   });
@@ -83,6 +80,35 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         { success: false, error: error.message || "Tracking sync failed." },
         { status: 500 }
       );
+    }
+  }
+
+  if (intent === "apply_surge" || intent === "manual_surge") {
+    const productId = formData.get("productId") as string;
+    if (!productId) {
+      return json({ success: false, error: "Missing product ID" }, { status: 400 });
+    }
+
+    try {
+      await db.surgedProduct.upsert({
+        where: {
+          id: productId,
+        },
+        create: {
+          shop,
+          shopifyProductId: productId,
+          surgeStatus: "AUTO_SURGED",
+          surgeExpiresAt: new Date(Date.now() + 15 * 60 * 1000),
+        },
+        update: {
+          surgeStatus: "AUTO_SURGED",
+          surgeExpiresAt: new Date(Date.now() + 15 * 60 * 1000),
+        },
+      });
+
+      return json({ success: true, message: "Surge applied and saved to DB." });
+    } catch (error: any) {
+      return json({ success: false, error: error.message }, { status: 500 });
     }
   }
 

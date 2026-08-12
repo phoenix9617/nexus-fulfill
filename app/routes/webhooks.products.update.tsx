@@ -19,8 +19,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const rawProductId = String((payload as any)?.id || "");
     const productGid = `gid://shopify/Product/${rawProductId}`;
 
-    // Check local database to see if the product is currently in a surge state
-    const existingProduct = await db.product.findFirst({
+    // Query db.surgedProduct using shop and product ID matches
+    const existingSurgedProduct = await db.surgedProduct.findFirst({
       where: {
         shop,
         OR: [
@@ -31,12 +31,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     });
 
     const isSurged =
-      existingProduct?.isSurged ||
-      (existingProduct?.surgeExpiresAt && new Date(existingProduct.surgeExpiresAt) > new Date());
+      existingSurgedProduct?.surgeStatus === "AUTO_SURGED" ||
+      existingSurgedProduct?.surgeStatus === "SURGED" ||
+      (existingSurgedProduct?.surgeExpiresAt &&
+        new Date(existingSurgedProduct.surgeExpiresAt) > new Date());
 
     if (isSurged) {
       console.log(
-        `[Webhook products/update] Ignored update for product ${rawProductId} (${shop}) because surge pricing is currently active.`
+        `[Webhook products/update] 🛑 BLOCKED SYNC for product ${rawProductId} on ${shop} because surge status is active.`
       );
       return new Response("Ignored: Product pricing is currently surged", { status: 200 });
     }
