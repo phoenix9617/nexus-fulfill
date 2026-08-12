@@ -24,8 +24,8 @@ interface ShopifyShippingAddress {
 
 interface ShopifyLineItem {
   id: number;
-  variant_id: number | null;
-  product_id: number | null;
+  variant_id: number | string | null;
+  product_id: number | string | null;
   title?: string;
   name?: string;
   sku?: string;
@@ -37,6 +37,16 @@ interface CJSubmitResult {
   success: boolean;
   cjOrderId?: string;
   error?: string;
+}
+
+function roundCurrency(val: number): number {
+  return Math.round((val + Number.EPSILON) * 100) / 100;
+}
+
+function ensureGid(id: number | string, type: "Product" | "ProductVariant" | "Order"): string {
+  const strId = String(id);
+  if (strId.startsWith("gid://")) return strId;
+  return `gid://shopify/${type}/${strId}`;
 }
 
 /**
@@ -55,7 +65,9 @@ async function submitOrderToCJ(orderData: {
   }
 
   const { shippingAddress } = orderData;
-  const customerName = `${shippingAddress.first_name || ""} ${shippingAddress.last_name || ""}`.trim() || "Customer";
+  const customerName =
+    `${shippingAddress.first_name || ""} ${shippingAddress.last_name || ""}`.trim() ||
+    "Customer";
 
   const payload = {
     orderNumber: orderData.name || orderData.orderId,
@@ -84,18 +96,32 @@ async function submitOrderToCJ(orderData: {
     });
 
     if (!res.ok) {
-      console.error(`[CJ Fulfillment] HTTP Error ${res.status} when creating order for ${orderData.name}`);
+      console.error(
+        `[CJ Fulfillment] HTTP Error ${res.status} when creating order for ${orderData.name}`
+      );
       return { success: false, error: `CJ HTTP Error ${res.status}` };
     }
 
-    const data = (await res.json()) as { code?: number; result?: string | { orderId?: string }; message?: string };
+    const data = (await res.json()) as {
+      code?: number;
+      result?: string | { orderId?: string };
+      message?: string;
+    };
+
     if (data.code === 200) {
-      const cjOrderId = typeof data.result === "string" ? data.result : data.result?.orderId || null;
-      console.log(`[CJ Fulfillment] Order submitted successfully for Shopify Order ${orderData.name}:`, cjOrderId);
+      const cjOrderId =
+        typeof data.result === "string" ? data.result : data.result?.orderId || null;
+      console.log(
+        `[CJ Fulfillment] Order submitted successfully for Shopify Order ${orderData.name}:`,
+        cjOrderId
+      );
       return { success: true, cjOrderId: cjOrderId || undefined };
     }
 
-    console.error(`[CJ Fulfillment] Submission rejected for Order ${orderData.name}:`, data.message);
+    console.error(
+      `[CJ Fulfillment] Submission rejected for Order ${orderData.name}:`,
+      data.message
+    );
     return { success: false, error: data.message || "CJ API Rejected Order" };
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : "Network Error";
@@ -120,7 +146,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return new Response("No line items to process", { status: 200 });
   }
 
-  const shopifyOrderId = payload.admin_graphql_api_id || `gid://shopify/Order/${payload.id}`;
+  const rawOrderId = payload.admin_graphql_api_id || payload.id;
+  const shopifyOrderId = ensureGid(rawOrderId, "Order");
   const orderName = payload.name || `#${payload.id}`;
   const shippingAddress: ShopifyShippingAddress | undefined = payload.shipping_address;
 
@@ -131,7 +158,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     );
 
     if (cjLineItems.length > 0 && shippingAddress) {
-      console.log(`[CJ Fulfillment] Found ${cjLineItems.length} supplier item(s) in Order ${orderName}`);
+      console.log(
+        `[CJ Fulfillment] Found ${cjLineItems.length} supplier item(s) in Order ${orderName}`
+      );
 
       const itemsToFulfill = cjLineItems.map((item) => ({
         sku: item.sku!,
@@ -164,106 +193,133 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   // --- 2. AUTO-SURGE PRICING ENGINE ---
-  const settings = await db.surgeSetting.findUnique({
-    where: { shop },
-  });
-
-  if (settings && "isEnabled" in settings && !settings.isEnabled) {
-    return new Response("Auto Surge disabled", { status: 200 });
-  }
-
-  const defaultThreshold = settings?.autoSalesThreshold ?? 10;
-  const defaultSurgePct = Number(settings?.autoSurgePercentage ?? 10.0);
-  const defaultResetDays = settings?.autoResetDays ?? 7;
-
-  // Resolve Admin API context with fallback
-  let admin: AdminApiContext | undefined = webhookAdmin;
-  if (!admin) {
-    try {
-      const unauthContext = await unauthenticated.admin(shop);
-      admin = unauthContext.admin;
-    } catch (e: unknown) {
-      console.warn(`Could not construct unauthenticated admin client for shop ${shop}:`, e);
-    }
-  }
-
-  for (const item of lineItems) {
-    if (!item.variant_id) continue;
-
-    const variantGid = `gid://shopify/ProductVariant/${item.variant_id}`;
-    const productGid = item.product_id ? `gid://shopify/Product/${item.product_id}` : undefined;
-    const quantityPurchased = item.quantity || 1;
-
-    let record = await db.surgedProduct.findUnique({
-      where: { shopifyVariantId: variantGid },
+  try {
+    const settings = await db.surgeSetting.findUnique({
+      where: { shop },
     });
 
-    if (!record) {
-      const itemPrice = parseFloat(item.price || "0");
-      record = await db.surgedProduct.create({
-        data: {
-          shop,
-          shopifyProductId: productGid || "",
-          shopifyVariantId: variantGid,
-          title: item.title || item.name || "Product Variant",
-          sku: item.sku || "",
-          originalPrice: itemPrice,
-          currentPrice: itemPrice,
-          salesCount: quantityPurchased,
-          autoSurgeThreshold: defaultThreshold,
-          resetDays: defaultResetDays,
-        },
-      });
-    } else {
-      record = await db.surgedProduct.update({
-        where: { id: record.id },
-        data: {
-          salesCount: { increment: quantityPurchased },
-        },
-      });
+    if (settings && "isEnabled" in settings && (settings as { isEnabled?: boolean }).isEnabled === false) {
+      return new Response("Auto Surge disabled", { status: 200 });
     }
 
-    // Trigger Surge Evaluation
-    const threshold = record.autoSurgeThreshold || defaultThreshold;
-    const currentSales = record.salesCount;
+    const defaultThreshold = settings?.autoSalesThreshold ?? 10;
+    const defaultSurgePct = Number(settings?.autoSurgePercentage ?? 10.0);
+    const defaultResetDays = settings?.autoResetDays ?? 7;
 
-    if (record.surgeStatus === "NORMAL" && currentSales >= threshold) {
-      const originalPriceNum = Number(record.originalPrice ?? 0);
-      const recordSurgePct = Number(record.surgePercentage ?? 0);
-      const surgePct = recordSurgePct > 0 ? recordSurgePct : defaultSurgePct;
-
-      const newPrice = Number((originalPriceNum * (1 + surgePct / 100)).toFixed(2));
-      const resetDays = record.resetDays || defaultResetDays;
-      const resetAt = new Date();
-      resetAt.setDate(resetAt.getDate() + resetDays);
-
-      if (admin) {
-        const res = await updateShopifyVariantPrice({
-          admin,
-          variantId: variantGid,
-          productId: productGid,
-          newPrice,
-        });
-
-        if (res.success) {
-          await db.surgedProduct.update({
-            where: { id: record.id },
-            data: {
-              currentPrice: res.price ?? newPrice,
-              surgeStatus: "AUTO_SURGED",
-              surgePercentage: surgePct,
-              surgedAt: new Date(),
-              resetAt,
-            },
-          });
-          console.log(`[Auto-Surge] Variant ${variantGid} successfully surged to $${res.price ?? newPrice}`);
-        } else {
-          console.error(`[Auto-Surge] Failed to surge variant ${variantGid}:`, res.error);
-        }
-      } else {
-        console.error(`[Auto-Surge] Skipped price update for ${variantGid}: Admin GraphQL client unavailable.`);
+    // Resolve Admin API context with fallback
+    let admin: AdminApiContext | undefined = webhookAdmin;
+    if (!admin) {
+      try {
+        const unauthContext = await unauthenticated.admin(shop);
+        admin = unauthContext.admin;
+      } catch (e: unknown) {
+        console.warn(
+          `[Auto-Surge] Could not construct unauthenticated admin client for shop ${shop}:`,
+          e
+        );
       }
     }
+
+    for (const item of lineItems) {
+      if (!item.variant_id) continue;
+
+      const variantGid = ensureGid(item.variant_id, "ProductVariant");
+      const productGid = item.product_id ? ensureGid(item.product_id, "Product") : undefined;
+      const quantityPurchased = Math.max(1, item.quantity || 1);
+
+      let record = await db.surgedProduct.findUnique({
+        where: { shopifyVariantId: variantGid },
+      });
+
+      const itemPrice = parseFloat(item.price || "0");
+      const safePrice = !Number.isNaN(itemPrice) && itemPrice >= 0 ? roundCurrency(itemPrice) : 0;
+
+      if (!record) {
+        record = await db.surgedProduct.create({
+          data: {
+            shop,
+            shopifyProductId: productGid || "",
+            shopifyVariantId: variantGid,
+            title: item.title || item.name || "Product Variant",
+            sku: item.sku || "N/A",
+            originalPrice: safePrice,
+            currentPrice: safePrice,
+            salesCount: quantityPurchased,
+            autoSurgeThreshold: defaultThreshold,
+            resetDays: defaultResetDays,
+          },
+        });
+      } else {
+        record = await db.surgedProduct.update({
+          where: { id: record.id },
+          data: {
+            salesCount: { increment: quantityPurchased },
+          },
+        });
+      }
+
+      // Trigger Surge Evaluation
+      const threshold = record.autoSurgeThreshold || defaultThreshold;
+      const currentSales = record.salesCount;
+
+      if (record.surgeStatus === "NORMAL" && currentSales >= threshold) {
+        const rawOriginal = Number(record.originalPrice);
+        const basePrice =
+          rawOriginal && rawOriginal > 0
+            ? roundCurrency(rawOriginal)
+            : safePrice > 0
+            ? safePrice
+            : roundCurrency(Number(record.currentPrice ?? 0));
+
+        if (basePrice <= 0) {
+          console.warn(`[Auto-Surge] Skipped variant ${variantGid}: Invalid baseline price ($${basePrice}).`);
+          continue;
+        }
+
+        const recordSurgePct = Number(record.surgePercentage ?? 0);
+        const surgePct = recordSurgePct > 0 ? recordSurgePct : defaultSurgePct;
+
+        const newPrice = roundCurrency(basePrice * (1 + surgePct / 100));
+        const resetDays = record.resetDays || defaultResetDays;
+        const resetAt = new Date();
+        resetAt.setDate(resetAt.getDate() + resetDays);
+
+        if (admin) {
+          const res = await updateShopifyVariantPrice({
+            admin,
+            variantId: variantGid,
+            productId: productGid || record.shopifyProductId,
+            newPrice,
+          });
+
+          if (res.success) {
+            const finalPrice = res.price ?? newPrice;
+            await db.surgedProduct.update({
+              where: { id: record.id },
+              data: {
+                originalPrice: basePrice,
+                currentPrice: finalPrice,
+                surgeStatus: "AUTO_SURGED",
+                surgePercentage: surgePct,
+                surgedAt: new Date(),
+                resetAt,
+              },
+            });
+            console.log(
+              `[Auto-Surge] Variant ${variantGid} successfully surged from $${basePrice.toFixed(2)} to $${finalPrice.toFixed(2)}`
+            );
+          } else {
+            console.error(`[Auto-Surge] Failed to surge variant ${variantGid}:`, res.error);
+          }
+        } else {
+          console.error(
+            `[Auto-Surge] Skipped price update for ${variantGid}: Admin GraphQL client unavailable.`
+          );
+        }
+      }
+    }
+  } catch (surgeError: unknown) {
+    console.error("[Auto-Surge] Workflow execution error:", surgeError);
   }
 
   return new Response("OK", { status: 200 });

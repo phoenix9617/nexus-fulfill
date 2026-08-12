@@ -1,11 +1,15 @@
+// app/services/shopifyPrice.server.ts
+
 import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
+import prisma from "../db.server";
+import { SurgeStatus } from "@prisma/client";
 
 export interface UpdateShopifyVariantPriceParams {
   admin: AdminApiContext;
   variantId: string;
   newPrice: number;
   compareAtPrice?: number | null;
-  productId?: string; // Optional parent product GID enables bulk update strategy
+  productId?: string;
 }
 
 export interface UpdateShopifyVariantPriceResult {
@@ -13,6 +17,20 @@ export interface UpdateShopifyVariantPriceResult {
   error?: string;
   price?: number;
   compareAtPrice?: number | null;
+}
+
+export interface ApplyPriceSurgeParams {
+  admin: AdminApiContext;
+  shop: string;
+  shopifyVariantId: string;
+  surgePercentage?: number;
+  resetDays?: number;
+  status?: SurgeStatus;
+}
+
+export interface RevertPriceSurgeParams {
+  admin: AdminApiContext;
+  shopifyVariantId: string;
 }
 
 interface ShopifyUserError {
@@ -80,9 +98,18 @@ const SINGLE_UPDATE_MUTATION = `#graphql
 `;
 
 /**
- * Updates a product variant's price in Shopify using GraphQL Admin API.
- * Uses productVariantsBulkUpdate if productId is available, automatically falling
- * back to productVariantUpdate if required.
+ * Ensures an ID string has proper Shopify GID format (e.g., gid://shopify/ProductVariant/12345)
+ */
+export function ensureGid(id: string, type: "Product" | "ProductVariant"): string {
+  if (!id) return id;
+  const prefix = `gid://shopify/${type}/`;
+  return id.startsWith("gid://") ? id : `${prefix}${id}`;
+}
+
+/**
+ * Updates a product variant's price in Shopify using the GraphQL Admin API.
+ * Leverages productVariantsBulkUpdate if a productId GID is provided, falling
+ * back automatically to productVariantUpdate if no productId exists or if the bulk operation fails.
  */
 export async function updateShopifyVariantPrice({
   admin,
@@ -91,7 +118,9 @@ export async function updateShopifyVariantPrice({
   compareAtPrice,
   productId,
 }: UpdateShopifyVariantPriceParams): Promise<UpdateShopifyVariantPriceResult> {
-  // Defensive guard against invalid numerical values
+  const formattedVariantId = ensureGid(variantId, "ProductVariant");
+  const formattedProductId = productId ? ensureGid(productId, "Product") : undefined;
+
   const safeNewPrice = typeof newPrice === "number" && !Number.isNaN(newPrice) ? newPrice : 0;
   const formattedPrice = safeNewPrice.toFixed(2);
 
@@ -102,11 +131,11 @@ export async function updateShopifyVariantPrice({
     formattedComparePrice = null;
   }
 
-  // 1. Primary Strategy: Bulk update if parent productId GID is provided
-  if (productId) {
+  // 1. Primary Strategy: Bulk update if parent productId GID is present
+  if (formattedProductId) {
     try {
       const variantInput: { id: string; price: string; compareAtPrice?: string | null } = {
-        id: variantId,
+        id: formattedVariantId,
         price: formattedPrice,
       };
 
@@ -116,7 +145,7 @@ export async function updateShopifyVariantPrice({
 
       const response = await admin.graphql(BULK_UPDATE_MUTATION, {
         variables: {
-          productId,
+          productId: formattedProductId,
           variants: [variantInput],
         },
       });
@@ -126,7 +155,7 @@ export async function updateShopifyVariantPrice({
       if (responseJson.errors && responseJson.errors.length > 0) {
         const topLevelError = responseJson.errors.map((e) => e.message).join(", ");
         console.warn(
-          `[Shopify Price Update] Bulk GraphQL error for variant ${variantId}: ${topLevelError}. Falling back to single mutation...`
+          `[Shopify Price Service] Bulk GraphQL error for variant ${formattedVariantId}: ${topLevelError}. Falling back to single mutation...`
         );
       } else {
         const userErrors = responseJson.data?.productVariantsBulkUpdate?.userErrors || [];
@@ -134,7 +163,7 @@ export async function updateShopifyVariantPrice({
         if (userErrors.length === 0) {
           const updatedVariant = responseJson.data?.productVariantsBulkUpdate?.productVariants?.[0];
           console.log(
-            `[Shopify Price Update] Successfully bulk-updated variant ${variantId} to $${formattedPrice}`
+            `[Shopify Price Service] Successfully bulk-updated variant ${formattedVariantId} to $${formattedPrice}`
           );
           return {
             success: true,
@@ -151,21 +180,21 @@ export async function updateShopifyVariantPrice({
           .map((e) => `${e.field?.join(".") || "field"}: ${e.message}`)
           .join(", ");
         console.warn(
-          `[Shopify Price Update] Bulk userErrors for variant ${variantId}: ${errorMsg}. Falling back to single mutation...`
+          `[Shopify Price Service] Bulk userErrors for variant ${formattedVariantId}: ${errorMsg}. Falling back to single mutation...`
         );
       }
     } catch (error: unknown) {
       const errMessage = error instanceof Error ? error.message : "Unknown error";
       console.warn(
-        `[Shopify Price Update] Bulk mutation exception for variant ${variantId}: ${errMessage}. Falling back to single mutation...`
+        `[Shopify Price Service] Bulk mutation exception for variant ${formattedVariantId}: ${errMessage}. Falling back to single mutation...`
       );
     }
   }
 
-  // 2. Secondary Strategy: Update directly via single productVariantUpdate
+  // 2. Secondary Strategy: Single variant update fallback
   try {
     const singleInput: { id: string; price: string; compareAtPrice?: string | null } = {
-      id: variantId,
+      id: formattedVariantId,
       price: formattedPrice,
     };
 
@@ -181,7 +210,10 @@ export async function updateShopifyVariantPrice({
 
     if (responseJson.errors && responseJson.errors.length > 0) {
       const topLevelError = responseJson.errors.map((e) => e.message).join(", ");
-      console.error(`[Shopify Price Update] Single GraphQL error for variant ${variantId}:`, topLevelError);
+      console.error(
+        `[Shopify Price Service] Single GraphQL error for variant ${formattedVariantId}:`,
+        topLevelError
+      );
       return { success: false, error: topLevelError };
     }
 
@@ -191,14 +223,18 @@ export async function updateShopifyVariantPrice({
       const errorMsg = userErrors
         .map((e) => `${e.field?.join(".") || "field"}: ${e.message}`)
         .join(", ");
-      console.error(`[Shopify Price Update] Single userErrors for variant ${variantId}:`, errorMsg);
+      console.error(
+        `[Shopify Price Service] Single userErrors for variant ${formattedVariantId}:`,
+        errorMsg
+      );
       return { success: false, error: errorMsg };
     }
 
     const updatedVariant = responseJson.data?.productVariantUpdate?.productVariant;
     console.log(
-      `[Shopify Price Update] Successfully updated single variant ${variantId} to $${formattedPrice}`
+      `[Shopify Price Service] Successfully updated single variant ${formattedVariantId} to $${formattedPrice}`
     );
+
     return {
       success: true,
       price: updatedVariant?.price ? parseFloat(updatedVariant.price) : safeNewPrice,
@@ -210,7 +246,132 @@ export async function updateShopifyVariantPrice({
     };
   } catch (error: unknown) {
     const errMessage = error instanceof Error ? error.message : "GraphQL execution failed";
-    console.error(`[Shopify Price Update] Single mutation failed for variant ${variantId}:`, error);
+    console.error(
+      `[Shopify Price Service] Single mutation failed for variant ${formattedVariantId}:`,
+      error
+    );
     return { success: false, error: errMessage };
   }
 }
+
+/**
+ * Calculates and applies a price surge for a given variant, updating both Shopify and Prisma.
+ */
+export async function applyPriceSurge({
+  admin,
+  shop,
+  shopifyVariantId,
+  surgePercentage,
+  resetDays,
+  status = SurgeStatus.AUTO_SURGED,
+}: ApplyPriceSurgeParams): Promise<UpdateShopifyVariantPriceResult> {
+  const formattedVariantId = ensureGid(shopifyVariantId, "ProductVariant");
+
+  // 1. Fetch current variant record and shop-level surge rules
+  const [product, settings] = await Promise.all([
+    prisma.surgedProduct.findUnique({ where: { shopifyVariantId: formattedVariantId } }),
+    prisma.surgeSetting.findUnique({ where: { shop } }),
+  ]);
+
+  if (!product) {
+    return { success: false, error: `SurgedProduct record not found for variant ${formattedVariantId}` };
+  }
+
+  const surgePct = surgePercentage ?? product.surgePercentage ?? settings?.autoSurgePercentage ?? 10.0;
+  const daysToReset = resetDays ?? product.resetDays ?? settings?.autoResetDays ?? 7;
+
+  // 2. Calculate surged price
+  let newPrice = Number((product.originalPrice * (1 + surgePct / 100)).toFixed(2));
+
+  // Apply maximum price cap if set in shop settings
+  if (settings?.maxPriceCap && newPrice > settings.maxPriceCap) {
+    newPrice = settings.maxPriceCap;
+  }
+
+  // 3. Update variant in Shopify (baseline original price moves to compareAtPrice)
+  const shopifyResult = await updateShopifyVariantPrice({
+    admin,
+    variantId: formattedVariantId,
+    newPrice,
+    compareAtPrice: product.originalPrice,
+    productId: product.shopifyProductId,
+  });
+
+  if (!shopifyResult.success) {
+    return shopifyResult;
+  }
+
+  // 4. Calculate auto-revert target date
+  const resetAt = new Date();
+  resetAt.setDate(resetAt.getDate() + daysToReset);
+
+  // 5. Commit updated status to Prisma
+  await prisma.surgedProduct.update({
+    where: { shopifyVariantId: formattedVariantId },
+    data: {
+      currentPrice: newPrice,
+      surgeStatus: status,
+      surgePercentage: surgePct,
+      surgedAt: new Date(),
+      resetAt: resetAt,
+    },
+  });
+
+  return {
+    success: true,
+    price: newPrice,
+    compareAtPrice: product.originalPrice,
+  };
+}
+
+/**
+ * Reverts a surged variant back to its original price baseline in Shopify and Prisma.
+ */
+export async function revertPriceSurge({
+  admin,
+  shopifyVariantId,
+}: RevertPriceSurgeParams): Promise<UpdateShopifyVariantPriceResult> {
+  const formattedVariantId = ensureGid(shopifyVariantId, "ProductVariant");
+
+  const product = await prisma.surgedProduct.findUnique({
+    where: { shopifyVariantId: formattedVariantId },
+  });
+
+  if (!product) {
+    return { success: false, error: `SurgedProduct record not found for variant ${formattedVariantId}` };
+  }
+
+  // 1. Reset price in Shopify and remove compareAtPrice (pass null)
+  const shopifyResult = await updateShopifyVariantPrice({
+    admin,
+    variantId: formattedVariantId,
+    newPrice: product.originalPrice,
+    compareAtPrice: null,
+    productId: product.shopifyProductId,
+  });
+
+  if (!shopifyResult.success) {
+    return shopifyResult;
+  }
+
+  // 2. Reset database record
+  await prisma.surgedProduct.update({
+    where: { shopifyVariantId: formattedVariantId },
+    data: {
+      currentPrice: product.originalPrice,
+      surgeStatus: SurgeStatus.NORMAL,
+      surgePercentage: 0.0,
+      surgedAt: null,
+      resetAt: null,
+    },
+  });
+
+  return {
+    success: true,
+    price: product.originalPrice,
+    compareAtPrice: null,
+  };
+}
+
+// Named alias to guarantee backwards compatibility across routes
+export const updateVariantPrice = updateShopifyVariantPrice;

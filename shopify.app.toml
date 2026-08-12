@@ -2,7 +2,7 @@
 
 client_id = "a9f70e5fa18cf7516ef5479abb2ae840"
 name = "NexusFulfill"
-application_url = "https://example.com"
+application_url = "https://nexus-fulfill-1.onrender.com"
 embedded = true
 
 [build]
@@ -13,12 +13,12 @@ dev_store_url = "nexusfulfill.myshopify.com"
 api_version = "2026-07"
 
   [[webhooks.subscriptions]]
-  uri = "/webhooks/products/create"
-  topics = [ "products/create" ]
-
-  [[webhooks.subscriptions]]
   uri = "/webhooks/orders/create"
   topics = [ "orders/create" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/products/create"
+  topics = [ "products/create" ]
 
   [[webhooks.subscriptions]]
   uri = "/webhooks/app/uninstalled"
@@ -26,15 +26,15 @@ api_version = "2026-07"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "read_orders,read_products,write_orders,write_products"
+scopes = "read_fulfillments,read_inventory,read_merchant_managed_fulfillment_orders,read_orders,read_products,write_fulfillments,write_inventory,write_merchant_managed_fulfillment_orders,write_orders,write_products"
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
 redirect_urls = [
-  "https://example.com/auth/callback",
-  "https://example.com/auth/shopify/callback",
-  "https://example.com/api/auth/callback"
+  "https://nexus-fulfill-1.onrender.com/auth/callback",
+  "https://nexus-fulfill-1.onrender.com/auth/shopify/callback",
+  "https://nexus-fulfill-1.onrender.com/api/auth/callback"
 ]
 
 [pos]

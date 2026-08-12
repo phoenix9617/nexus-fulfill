@@ -1,5 +1,7 @@
 // app/services/cj.server.ts
 
+import db from "../db.server";
+
 const CJ_API_BASE = "https://developers.cjdropshipping.com/api2.0/v1";
 
 // --- Types & Interfaces ---
@@ -19,13 +21,13 @@ export interface StandardProduct {
 export interface CJAuthResponse {
   code: number;
   message: string;
-  result: {
+  result?: {
     accessToken: string;
-    accessTokenExpiryDate: string;
+    accessTokenExpiryDate?: string;
   };
   data?: {
     accessToken: string;
-    accessTokenExpiryDate: string;
+    accessTokenExpiryDate?: string;
   };
 }
 
@@ -84,7 +86,12 @@ export interface CJShippingCostRequest {
 export interface CJShippingCostResponse {
   code: number;
   message: string;
-  result: Array<{
+  result?: Array<{
+    logisticName: string;
+    logisticAging: string;
+    logisticPrice: number;
+  }>;
+  data?: Array<{
     logisticName: string;
     logisticAging: string;
     logisticPrice: number;
@@ -158,30 +165,50 @@ export function parseCJVariantProperties(
   return options;
 }
 
-// --- API Helpers ---
+// --- API Helpers & Authentication ---
 
 /**
- * Obtain an Access Token from CJ Dropshipping
+ * Retrieves a valid CJ Dropshipping Access Token with Prisma database caching fallback.
  */
 export async function getCJAccessToken(customApiKey?: string): Promise<string | null> {
   const apiKey = customApiKey || process.env.CJ_API_KEY || process.env.CJ_ACCESS_TOKEN;
-  if (!apiKey) {
-    console.error("[CJ Server] Missing CJ API Key/Token.");
-    return null;
-  }
+  const email = process.env.CJ_EMAIL || "";
 
-  // If provided key is already a full JWT access token (long string), return directly
-  if (apiKey.length > 50 && !apiKey.includes("-")) {
+  // Direct JWT fallback (if long token string is directly passed via env)
+  if (apiKey && apiKey.length > 50 && !apiKey.includes("-")) {
     return apiKey;
   }
 
+  // 1. Check DB cache if standard system credentials are being used
+  if (email && !customApiKey) {
+    try {
+      const cachedToken = await db.cjToken.findFirst({
+        where: { email },
+        orderBy: { createdAt: "desc" },
+      });
+
+      if (cachedToken && cachedToken.expiresAt > new Date()) {
+        return cachedToken.accessToken;
+      }
+    } catch (dbError) {
+      console.warn("[CJ Server] Database lookup error for token cache, proceeding to API auth:", dbError);
+    }
+  }
+
+  if (!apiKey) {
+    console.error("[CJ Server] Missing CJ API Key / Token in environment configuration.");
+    return null;
+  }
+
+  // 2. Query CJ Authentication API
   try {
     const res = await fetch(`${CJ_API_BASE}/authentication/getAccessToken`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        email: process.env.CJ_EMAIL,
+        email,
         apiKey,
+        password: apiKey,
       }),
     });
 
@@ -190,9 +217,28 @@ export async function getCJAccessToken(customApiKey?: string): Promise<string | 
     }
 
     const data: CJAuthResponse = await res.json();
-    const token = data.result?.accessToken || data.data?.accessToken;
+    const tokenData = data.result || data.data;
+    const token = tokenData?.accessToken;
 
     if ((data.code === 200 || data.code === 0) && token) {
+      // 3. Upsert newly retrieved token into DB
+      if (email && !customApiKey) {
+        const expiryStr = tokenData?.accessTokenExpiryDate;
+        const expiresAt = expiryStr
+          ? new Date(expiryStr)
+          : new Date(Date.now() + 14 * 24 * 60 * 60 * 1000); // Default 14-day duration
+
+        try {
+          await db.cjToken.upsert({
+            where: { email },
+            update: { accessToken: token, expiresAt },
+            create: { email, accessToken: token, expiresAt },
+          });
+        } catch (saveError) {
+          console.warn("[CJ Server] Could not cache CJ access token to database:", saveError);
+        }
+      }
+
       return token;
     }
 
@@ -246,30 +292,33 @@ export async function searchCJProducts(
       (Array.isArray(data.data) ? data.data : []) ||
       (Array.isArray(data.result) ? data.result : []);
 
-    return rawList.map((item: any) => ({
-      id: `cj_${item.pid}`,
-      externalId: item.pid,
-      source: "CJ Dropshipping" as const,
-      supplier: "CJ Dropshipping",
-      title: item.productNameEn || item.productName || "Untitled Product",
-      price: parseFloat(item.sellPrice || item.productPrice || item.price || "0"),
-      image: item.productImage || "",
-      description: item.description || item.productNameEn || item.productName || "",
-      sku: item.productSku || `CJ-${item.pid}`,
-    }));
+    return rawList.map((item: Record<string, unknown>) => {
+      const pid = String(item.pid || "");
+      return {
+        id: `cj_${pid}`,
+        externalId: pid,
+        source: "CJ Dropshipping" as const,
+        supplier: "CJ Dropshipping",
+        title: String(item.productNameEn || item.productName || "Untitled Product"),
+        price: parseFloat(String(item.sellPrice || item.productPrice || item.price || "0")),
+        image: String(item.productImage || ""),
+        description: String(item.description || item.productNameEn || item.productName || ""),
+        sku: String(item.productSku || `CJ-${pid}`),
+      };
+    });
   } catch (error) {
     console.error("[CJ Server] Product search error:", error);
     return [];
   }
 }
 
-// Alias for searchCJProducts to support imports expecting fetchCJProducts
+// Alias for searchCJProducts
 export const fetchCJProducts = searchCJProducts;
 
 /**
  * Fetch complete Product Details
  */
-export async function getCJProductDetail(productId: string, apiKeyOrToken?: string) {
+export async function getCJProductDetail(productId: string, apiKeyOrToken?: string): Promise<CJProductDetail | null> {
   const token = await getCJAccessToken(apiKeyOrToken);
   if (!token) return null;
 
@@ -436,7 +485,7 @@ export async function calculateCJShipping(params: CJShippingCostRequest, apiKeyO
 
     const data: CJShippingCostResponse = await res.json();
     if (data.code === 200 || data.code === 0) {
-      return data.result;
+      return data.result || data.data || null;
     }
   } catch (error) {
     console.error("[CJ Server] Shipping calculation error:", error);
@@ -537,12 +586,12 @@ export async function getCJTrackingInfo(cjOrderId: string, apiKeyOrToken?: strin
  * Fetch and normalize tracking information for a CJ Order
  */
 export async function getCJTracking(cjOrderId: string, apiKeyOrToken?: string) {
-  const raw = await getCJTrackingInfo(cjOrderId, apiKeyOrToken);
+  const raw = (await getCJTrackingInfo(cjOrderId, apiKeyOrToken)) as Record<string, unknown> | null;
   if (!raw) return null;
 
   return {
-    trackingNumber: raw.trackingNumber || raw.trackNumber || raw.logisticTrackNo || null,
-    carrier: raw.carrier || raw.logisticName || raw.logisticCompany || "CJ Logistics",
+    trackingNumber: String(raw.trackingNumber || raw.trackNumber || raw.logisticTrackNo || ""),
+    carrier: String(raw.carrier || raw.logisticName || raw.logisticCompany || "CJ Logistics"),
     raw,
   };
 }

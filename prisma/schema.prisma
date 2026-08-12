@@ -10,7 +10,10 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
-// Shopify Session Store required by @shopify/shopify-app-session-storage-prisma
+// ==========================================
+// Shopify Session Store
+// Required by @shopify/shopify-app-session-storage-prisma
+// ==========================================
 model Session {
   id                  String    @id
   shop                String
@@ -33,14 +36,16 @@ model Session {
   @@index([shop])
 }
 
-// App Settings & Multi-Supplier API Credentials
+// ==========================================
+// App Settings & Multi-Supplier Credentials
+// ==========================================
 model AppSettings {
   id                 String   @id @default(uuid())
   shop               String   @unique
   cjEmail            String?
   cjApiKey           String?
-  rapidApiKey        String? // RapidAPI Key for AliExpress Sourcing API
-  aliExpressToken    String? // Official AliExpress Open Platform Access Token
+  rapidApiKey        String?  // RapidAPI Key for AliExpress Sourcing API
+  aliExpressToken    String?  // Official AliExpress Open Platform Access Token
   aliExpressApiKey   String?
   aliExpressSecret   String?
   failoverEnabled    Boolean  @default(true)
@@ -88,7 +93,9 @@ model RerouteLog {
   @@index([orderId])
 }
 
-// --- Price Surge Engine Models ---
+// ==========================================
+// Price Surge Engine Models
+// ==========================================
 
 enum SurgeStatus {
   NORMAL
@@ -99,11 +106,14 @@ enum SurgeStatus {
 // Global or Shop-Level Auto-Surge Rules
 model SurgeSetting {
   id                  String   @id @default(uuid())
-  shop                String   @unique // Enables db.surgeSetting.upsert({ where: { shop } })
+  shop                String   @unique
   isEnabled           Boolean  @default(true)
-  autoSalesThreshold  Int      @default(10) // Sales required to trigger surge
-  autoSurgePercentage Float    @default(10.0) // Default price increase %
-  autoResetDays       Int      @default(7) // Days before reverting price
+  salesThreshold      Int      @default(5)     // Standard threshold
+  surgePercentage     Float    @default(10.0)  // Standard surge percentage
+  maxPriceCap         Float?                   // Price ceiling cap
+  autoSalesThreshold  Int      @default(10)    // Dynamic trigger threshold
+  autoSurgePercentage Float    @default(10.0)  // Dynamic surge percentage
+  autoResetDays       Int      @default(7)     // Days before reverting price
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 }
@@ -112,29 +122,33 @@ model SurgeSetting {
 model SurgedProduct {
   id                 String      @id @default(uuid())
   shop               String
-  shopifyProductId   String // e.g. "gid://shopify/Product/123456"
+  shopifyProductId   String      // e.g. "gid://shopify/Product/123456"
   shopifyVariantId   String      @unique // e.g. "gid://shopify/ProductVariant/789012"
-  title              String // Variant title / Product title
+  title              String      // Variant title / Product title
   sku                String?     @default("")
-  originalPrice      Float // Baseline price to revert back to
-  currentPrice       Float // Active price in store
+  originalPrice      Float       // Baseline price to revert back to
+  currentPrice       Float       // Active price in store
   salesCount         Int         @default(0) // Order volume counter
   surgeStatus        SurgeStatus @default(NORMAL)
   surgePercentage    Float       @default(0.0)
-  autoSurgeThreshold Int         @default(10)
-  resetDays          Int         @default(7)
-  surgedAt           DateTime? // Timestamp when surge was activated
-  resetAt            DateTime? // Target timestamp when price should revert
+  autoSurgeThreshold Int?        @default(10)
+  resetDays          Int?        @default(7)
+  surgedAt           DateTime?   // Timestamp when surge was activated
+  resetAt            DateTime?   // Target timestamp when price should revert
   createdAt          DateTime    @default(now())
   updatedAt          DateTime    @updatedAt
 
   @@index([shop])
   @@index([sku])
   @@index([surgeStatus])
+  @@index([shop, resetAt])
+  @@index([shop, surgeStatus])
   @@index([resetAt, surgeStatus]) // Optimized for cron auto-reset lookup
 }
 
-// --- Imported Inventory & Variant Sourcing Models ---
+// ==========================================
+// Imported Inventory & Variant Sourcing Models
+// ==========================================
 
 model ImportedProduct {
   id                    String            @id @default(uuid())
@@ -143,7 +157,7 @@ model ImportedProduct {
   title                 String
   vendor                String?
   category              String?
-  image                 String? // Main product featured image
+  image                 String?           // Main product featured image
   landedCost            Float             @default(0.0)
   originalRetailPrice   Float             @default(0.0) // Base product retail price before surge
   retailPrice           Float             @default(0.0) // Active retail price (includes active surge)
@@ -164,11 +178,11 @@ model ImportedVariant {
   productId        String
   product          ImportedProduct @relation(fields: [productId], references: [id], onDelete: Cascade)
   shopifyVariantId String?         @unique // e.g., "gid://shopify/ProductVariant/987654321"
-  inventoryItemId  String? // e.g., "gid://shopify/InventoryItem/11223344"
-  cjVid            String? // CJ Dropshipping Variant ID mapping
+  inventoryItemId  String?         // e.g., "gid://shopify/InventoryItem/11223344"
+  cjVid            String?         // CJ Dropshipping Variant ID mapping
   title            String
   sku              String?
-  image            String? // Variant-specific image
+  image            String?         // Variant-specific image
   price            Float           @default(0.0)
   originalPrice    Float           @default(0.0) // Baseline variant price
   landedCost       Float           @default(0.0)
@@ -181,7 +195,9 @@ model ImportedVariant {
   @@index([shopifyVariantId])
 }
 
-// --- Auto-Fulfillment & Tracking Sync Queue ---
+// ==========================================
+// Auto-Fulfillment & Tracking Sync Queue
+// ==========================================
 
 model FulfilledOrder {
   id             String   @id @default(uuid())
@@ -189,6 +205,7 @@ model FulfilledOrder {
   shopifyOrderId String   @unique
   cjOrderId      String?
   status         String   @default("PROCESSING") // "PROCESSING", "FULFILLED", "FAILED"
+  carrier        String?  // Shipping carrier name (e.g., USPS, DHL)
   trackingNumber String?
   trackingUrl    String?
   createdAt      DateTime @default(now())

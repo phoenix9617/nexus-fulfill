@@ -66,7 +66,7 @@ function roundCurrency(val: number): number {
 // --- Server Loader ---
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
 
   let settings = await db.surgeSetting.findUnique({
@@ -84,6 +84,54 @@ export async function loader({ request }: LoaderFunctionArgs) {
     });
   }
 
+  const now = new Date();
+
+  // Auto-reset expired surged products concurrently
+  const expiredProducts = await db.surgedProduct.findMany({
+    where: {
+      shop,
+      surgeStatus: { in: ["FORCE_SURGED", "AUTO_SURGED"] },
+      resetAt: { lte: now },
+    },
+  });
+
+  if (expiredProducts.length > 0) {
+    await Promise.allSettled(
+      expiredProducts.map(async (prod) => {
+        const rawOriginal = Number(prod.originalPrice);
+        const origPrice = roundCurrency(
+          rawOriginal && rawOriginal > 0 ? rawOriginal : Number(prod.currentPrice ?? 0)
+        );
+
+        if (origPrice <= 0) return;
+
+        try {
+          const res = await updateShopifyVariantPrice({
+            admin,
+            variantId: prod.shopifyVariantId,
+            newPrice: origPrice,
+          });
+
+          // Update DB state only if Shopify variant price update was successful
+          if (res?.success !== false) {
+            await db.surgedProduct.update({
+              where: { id: prod.id },
+              data: {
+                currentPrice: origPrice,
+                surgeStatus: "NORMAL",
+                surgePercentage: 0,
+                surgedAt: null,
+                resetAt: null,
+              },
+            });
+          }
+        } catch (err) {
+          console.error(`Failed to auto-reset variant ${prod.shopifyVariantId}:`, err);
+        }
+      })
+    );
+  }
+
   const rawProducts = await db.surgedProduct.findMany({
     where: {
       shop,
@@ -94,7 +142,6 @@ export async function loader({ request }: LoaderFunctionArgs) {
     orderBy: { updatedAt: "desc" },
   });
 
-  const now = new Date();
   const products: SurgedProductUI[] = rawProducts.map((p) => {
     let daysRemaining: number | undefined = undefined;
     if (p.resetAt) {
@@ -111,7 +158,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
         : "NORMAL";
 
     const currentPriceNum = roundCurrency(Number(p.currentPrice ?? 0));
-    const originalPriceNum = roundCurrency(Number(p.originalPrice ?? currentPriceNum));
+    const originalPriceNum = roundCurrency(
+      Number(p.originalPrice) > 0 ? Number(p.originalPrice) : currentPriceNum
+    );
 
     return {
       id: p.id,
@@ -165,8 +214,19 @@ export async function action({ request }: ActionFunctionArgs) {
         return json<ActionData>({ success: false, message: "Product record not found" }, { status: 404 });
       }
 
-      const rawOriginal = Number(record.originalPrice ?? record.currentPrice ?? 0);
-      const basePrice = rawOriginal > 0 ? rawOriginal : Number(record.currentPrice ?? 0);
+      const rawOriginal = Number(record.originalPrice);
+      const basePrice =
+        rawOriginal && rawOriginal > 0
+          ? roundCurrency(rawOriginal)
+          : roundCurrency(Number(record.currentPrice ?? 0));
+
+      if (basePrice <= 0) {
+        return json<ActionData>(
+          { success: false, message: "Cannot surge product with zero or invalid baseline price." },
+          { status: 400 }
+        );
+      }
+
       const newPrice = roundCurrency(basePrice * (1 + percentage / 100));
 
       const res = await updateShopifyVariantPrice({
@@ -218,9 +278,11 @@ export async function action({ request }: ActionFunctionArgs) {
         return json<ActionData>({ success: false, message: "Product record not found" }, { status: 404 });
       }
 
-      const originalPriceNum = roundCurrency(
-        Number(record.originalPrice ?? record.currentPrice ?? 0)
-      );
+      const rawOriginal = Number(record.originalPrice);
+      const originalPriceNum =
+        rawOriginal && rawOriginal > 0
+          ? roundCurrency(rawOriginal)
+          : roundCurrency(Number(record.currentPrice ?? 0));
 
       const res = await updateShopifyVariantPrice({
         admin,
@@ -362,11 +424,16 @@ export default function PriceSurgeEngine() {
   const submittingProductId = fetcher.formData?.get("productId")?.toString();
 
   useEffect(() => {
-    if (fetcher.data?.success && surgeModalOpen && fetcher.formData?.get("intent") === "force_surge") {
+    if (
+      fetcher.state === "idle" &&
+      fetcher.data?.success &&
+      surgeModalOpen &&
+      fetcher.formData?.get("intent") === "force_surge"
+    ) {
       setSurgeModalOpen(false);
       setTargetProduct(null);
     }
-  }, [fetcher.data, surgeModalOpen, fetcher.formData]);
+  }, [fetcher.state, fetcher.data, fetcher.formData, surgeModalOpen]);
 
   const handleSyncProducts = useCallback(() => {
     fetcher.submit({ intent: "sync_products" }, { method: "POST" });
@@ -413,15 +480,18 @@ export default function PriceSurgeEngine() {
     );
   }, [targetProduct, selectedSurgePct, customPctInput, fetcher]);
 
-  const handleStopSurge = useCallback((product: SurgedProductUI) => {
-    fetcher.submit(
-      {
-        intent: "stop_surge",
-        productId: product.id,
-      },
-      { method: "POST" }
-    );
-  }, [fetcher]);
+  const handleStopSurge = useCallback(
+    (product: SurgedProductUI) => {
+      fetcher.submit(
+        {
+          intent: "stop_surge",
+          productId: product.id,
+        },
+        { method: "POST" }
+      );
+    },
+    [fetcher]
+  );
 
   const handleSaveAutoSettings = useCallback(() => {
     const rawPct = autoSurgePercentage === "custom" ? customSurgeValue : autoSurgePercentage;
@@ -653,11 +723,11 @@ export default function PriceSurgeEngine() {
 
                       <IndexTable.Cell>
                         {product.surgeStatus === "FORCE_SURGED" ? (
-                          <Badge tone="attention" icon={CashDollarIcon}>
+                          <Badge tone="attention">
                             Force Surged (+{product.surgePercentage}%)
                           </Badge>
                         ) : product.surgeStatus === "AUTO_SURGED" ? (
-                          <Badge tone="info" icon={CashDollarIcon}>
+                          <Badge tone="info">
                             Auto Surged (+{product.surgePercentage}%)
                           </Badge>
                         ) : (
