@@ -30,7 +30,6 @@ async function handleCronExecution(request: Request) {
   let trackingUpdatedCount = 0;
   try {
     const trackingRes = await syncCJTrackingOrders();
-    // Safely extract count without dumping large object payload into response
     trackingUpdatedCount =
       typeof trackingRes?.updatedCount === "number"
         ? trackingRes.updatedCount
@@ -128,12 +127,10 @@ async function handleCronExecution(request: Request) {
     }
   }
 
-  // Log full errors to Render server logs instead of sending them in HTTP body
   if (errors.length > 0) {
     console.error(`[Price Reset Cron] Encountered ${errors.length} errors:`, errors);
   }
 
-  // Return a compact JSON response (< 150 bytes)
   return json({
     success: errors.length === 0,
     timestamp: new Date().toISOString(),
