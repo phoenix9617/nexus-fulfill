@@ -1,5 +1,3 @@
-// app/routes/api.cron.reset-prices.tsx
-
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import db from "../db.server";
@@ -29,9 +27,18 @@ async function handleCronExecution(request: Request) {
   }
 
   // --- Task 1: CJ Tracking Number & Fulfillment Sync ---
-  let trackingSyncResult = { success: true, updatedCount: 0 };
+  let trackingUpdatedCount = 0;
   try {
-    trackingSyncResult = await syncCJTrackingOrders();
+    const trackingRes = await syncCJTrackingOrders();
+    // Safely extract count without dumping large object payload into response
+    trackingUpdatedCount =
+      typeof trackingRes?.updatedCount === "number"
+        ? trackingRes.updatedCount
+        : typeof trackingRes?.count === "number"
+        ? trackingRes.count
+        : 0;
+
+    console.log("[Cron Reset Prices] Tracking Sync finished:", trackingRes);
   } catch (trackingErr) {
     console.error("[Cron Reset Prices] Error during tracking sync:", trackingErr);
   }
@@ -121,15 +128,19 @@ async function handleCronExecution(request: Request) {
     }
   }
 
+  // Log full errors to Render server logs instead of sending them in HTTP body
+  if (errors.length > 0) {
+    console.error(`[Price Reset Cron] Encountered ${errors.length} errors:`, errors);
+  }
+
+  // Return a compact JSON response (< 150 bytes)
   return json({
-    success: true,
+    success: errors.length === 0,
     timestamp: new Date().toISOString(),
-    trackingSync: trackingSyncResult,
-    priceReset: {
-      processed: resetCount,
-      totalExpired: expiredProducts.length,
-      errors: errors.length > 0 ? errors : undefined,
-    },
+    trackingUpdatedCount,
+    resetCount,
+    totalExpired: expiredProducts.length,
+    errorCount: errors.length,
   });
 }
 
