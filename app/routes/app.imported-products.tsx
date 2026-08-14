@@ -991,15 +991,7 @@ export default function ImportedProductsPage() {
                                 alignItems: "flex-end",
                               }}
                             >
-                              <Badge
-                                tone={
-                                  product.syncStatus === "synced"
-                                    ? "success"
-                                    : product.syncStatus === "pending"
-                                    ? "attention"
-                                    : "critical"
-                                }
-                              >
+                              <Badge tone={product.syncStatus === "synced" ? "success" : "attention"}>
                                 {product.syncStatus.toUpperCase()}
                               </Badge>
 
@@ -1011,155 +1003,112 @@ export default function ImportedProductsPage() {
                             </div>
                           </div>
 
-                          {/* Product Info */}
+                          {/* Details & Actions */}
                           <Box padding="400">
                             <BlockStack gap="300">
                               <BlockStack gap="100">
-                                <Text as="h3" variant="headingSm" truncate>
+                                <Text variant="bodyMd" fontWeight="bold" as="h3" truncate>
                                   {product.title}
                                 </Text>
-                                <InlineStack gap="200" align="space-between">
-                                  <Text as="span" variant="bodyXs" tone="subdued">
-                                    {product.category}
-                                  </Text>
-                                  <Text as="span" variant="bodyXs" tone="subdued">
-                                    SKU: {product.sku}
-                                  </Text>
-                                </InlineStack>
+                                <Text variant="bodyXs" tone="subdued" as="p">
+                                  {product.category} • SKU: {product.sku}
+                                </Text>
                               </BlockStack>
 
                               <Divider />
 
-                              {/* Price & Margin Breakdown */}
-                              <BlockStack gap="100">
-                                <InlineStack align="space-between">
-                                  <Text as="span" variant="bodySm" tone="subdued">
-                                    Retail Price:
+                              <InlineStack align="space-between" blockAlign="center">
+                                <BlockStack gap="050">
+                                  <Text variant="bodyXs" tone="subdued" as="span">
+                                    Retail Price
                                   </Text>
-                                  <Text as="span" variant="bodyMd" fontWeight="bold">
+                                  <Text variant="bodyMd" fontWeight="bold" as="span">
                                     ${product.retailPrice.toFixed(2)}
                                   </Text>
-                                </InlineStack>
+                                </BlockStack>
 
-                                <InlineStack align="space-between">
-                                  <Text as="span" variant="bodySm" tone="subdued">
-                                    Landed Cost:
+                                <BlockStack gap="050">
+                                  <Text variant="bodyXs" tone="subdued" as="span">
+                                    Landed Cost
                                   </Text>
-                                  <Text as="span" variant="bodySm">
+                                  <Text variant="bodyMd" tone="subdued" as="span">
                                     ${product.landedCost.toFixed(2)}
                                   </Text>
-                                </InlineStack>
+                                </BlockStack>
 
+                                <BlockStack gap="050">
+                                  <Text variant="bodyXs" tone="subdued" as="span">
+                                    Stock
+                                  </Text>
+                                  <Badge tone={totalStock > 0 ? "info" : "critical"}>
+                                    {`${totalStock} units`}
+                                  </Badge>
+                                </BlockStack>
+                              </InlineStack>
+
+                              <Box background="bg-surface-secondary" padding="200" borderRadius="100">
                                 <InlineStack align="space-between">
-                                  <Text as="span" variant="bodySm" tone="subdued">
-                                    Est. Profit:
+                                  <Text variant="bodyXs" tone="subdued" as="span">
+                                    Margin: {profitMargin}%
                                   </Text>
-                                  <Text
-                                    as="span"
-                                    variant="bodySm"
-                                    fontWeight="bold"
-                                    tone={unitProfit > 0 ? "success" : "critical"}
-                                  >
-                                    ${unitProfit.toFixed(2)} ({profitMargin}%)
+                                  <Text variant="bodyXs" fontWeight="bold" tone="success" as="span">
+                                    +${unitProfit.toFixed(2)} / item
                                   </Text>
                                 </InlineStack>
+                              </Box>
 
-                                <InlineStack align="space-between">
-                                  <Text as="span" variant="bodySm" tone="subdued">
-                                    Total Stock:
-                                  </Text>
-                                  <Text as="span" variant="bodySm">
-                                    {totalStock} units
-                                  </Text>
-                                </InlineStack>
-                              </BlockStack>
-
-                              <Divider />
-
-                              {/* Quick Surge Controls */}
-                              <BlockStack gap="200">
-                                <Text as="span" variant="bodyXs" fontWeight="bold">
-                                  Price Surge Controls
-                                </Text>
-                                <InlineStack gap="100">
-                                  <Button
-                                    size="micro"
-                                    onClick={() => handleApplyForceSurge(product.id, 10)}
-                                  >
-                                    +10%
-                                  </Button>
-                                  <Button
-                                    size="micro"
-                                    onClick={() => handleApplyForceSurge(product.id, 20)}
-                                  >
-                                    +20%
-                                  </Button>
-                                  <Button
-                                    size="micro"
-                                    onClick={() => handleApplyForceSurge(product.id, 30)}
-                                  >
-                                    +30%
-                                  </Button>
-                                </InlineStack>
-
-                                <InlineStack gap="200" blockAlign="center">
-                                  <div style={{ flexGrow: 1 }}>
-                                    <TextField
-                                      label="Custom Surge"
-                                      labelHidden
-                                      placeholder="Custom %"
-                                      type="number"
-                                      value={currentCustomVal}
-                                      onChange={(val) =>
-                                        setCustomSurges((prev) => ({
-                                          ...prev,
-                                          [product.id]: val,
-                                        }))
-                                      }
-                                      autoComplete="off"
-                                    />
-                                  </div>
-                                  <Button
-                                    size="slim"
-                                    onClick={() =>
-                                      handleApplyForceSurge(
-                                        product.id,
-                                        parseFloat(currentCustomVal)
-                                      )
+                              {/* Surge Price Control */}
+                              <InlineStack gap="200" blockAlign="center">
+                                <div style={{ width: "90px" }}>
+                                  <TextField
+                                    label=""
+                                    labelHidden
+                                    type="number"
+                                    placeholder="%"
+                                    value={currentCustomVal}
+                                    onChange={(val) =>
+                                      setCustomSurges((prev) => ({ ...prev, [product.id]: val }))
                                     }
-                                  >
-                                    Apply
-                                  </Button>
-                                </InlineStack>
-
+                                    autoComplete="off"
+                                  />
+                                </div>
+                                <Button
+                                  size="micro"
+                                  variant="secondary"
+                                  onClick={() =>
+                                    handleApplyForceSurge(
+                                      product.id,
+                                      parseFloat(currentCustomVal)
+                                    )
+                                  }
+                                >
+                                  Surge
+                                </Button>
                                 {hasActiveSurge && (
                                   <Button
-                                    size="slim"
+                                    size="micro"
                                     tone="critical"
+                                    variant="plain"
                                     onClick={() => handleRemoveSurge(product.id)}
                                   >
-                                    Reset Surge Price
+                                    Reset
                                   </Button>
                                 )}
-                              </BlockStack>
+                              </InlineStack>
 
-                              <Divider />
-
-                              {/* Footer Action Buttons */}
+                              {/* Action Buttons */}
                               <InlineStack gap="200" align="space-between">
                                 <Button
                                   icon={EditIcon}
-                                  size="slim"
                                   onClick={() => handleOpenManageModal(product)}
                                 >
-                                  Edit
+                                  Edit Product
                                 </Button>
                                 <Button
                                   icon={RefreshIcon}
-                                  size="slim"
                                   onClick={() => handleSyncSingleProduct(product.id)}
                                 >
-                                  Re-sync
+                                  Sync
                                 </Button>
                               </InlineStack>
                             </BlockStack>
@@ -1175,14 +1124,14 @@ export default function ImportedProductsPage() {
         </Layout.Section>
       </Layout>
 
-      {/* Product Edit Modal */}
+      {/* Edit Product Modal */}
       {selectedProduct && (
         <Modal
           open={activeModal}
           onClose={() => setActiveModal(false)}
-          title={`Manage ${selectedProduct.title}`}
+          title={`Edit Product - ${selectedProduct.title}`}
           primaryAction={{
-            content: "Save Changes",
+            content: "Save & Push to Shopify",
             onAction: handleSaveChanges,
             loading: isSaving,
           }}
@@ -1210,65 +1159,62 @@ export default function ImportedProductsPage() {
 
               <Divider />
 
-              <Text as="h3" variant="headingSm">
-                Product Variants
+              <Text variant="headingSm" as="h4">
+                Variants & Inventory
               </Text>
 
-              {editVariants.map((variant, index) => (
-                <Card key={variant.variantId || index}>
+              {editVariants.map((variant, idx) => (
+                <Box
+                  key={variant.variantId || idx}
+                  padding="300"
+                  background="bg-surface-secondary"
+                  borderRadius="200"
+                >
                   <BlockStack gap="300">
-                    <Text as="h4" fontWeight="bold">
-                      Variant #{index + 1}: {variant.name}
+                    <Text variant="bodyMd" fontWeight="bold" as="p">
+                      Variant {idx + 1}: {variant.name}
                     </Text>
                     <Grid>
-                      <Grid.Cell columnSpan={{ xs: 6, sm: 6, md: 6, lg: 6, xl: 6 }}>
-                        <TextField
-                          label="Variant Title"
-                          value={variant.name}
-                          onChange={(val) => handleUpdateVariantField(index, "name", val)}
-                          autoComplete="off"
-                        />
-                      </Grid.Cell>
-                      <Grid.Cell columnSpan={{ xs: 6, sm: 6, md: 6, lg: 6, xl: 6 }}>
+                      <Grid.Cell columnSpan={{ xs: 6, sm: 3, md: 3, lg: 3, xl: 3 }}>
                         <TextField
                           label="SKU"
                           value={variant.sku}
-                          onChange={(val) => handleUpdateVariantField(index, "sku", val)}
+                          onChange={(v) => handleUpdateVariantField(idx, "sku", v)}
                           autoComplete="off"
                         />
                       </Grid.Cell>
-                      <Grid.Cell columnSpan={{ xs: 6, sm: 6, md: 4, lg: 4, xl: 4 }}>
+                      <Grid.Cell columnSpan={{ xs: 6, sm: 3, md: 3, lg: 3, xl: 3 }}>
                         <TextField
-                          label="Price ($)"
+                          label="Retail Price ($)"
                           type="number"
                           value={variant.price.toString()}
-                          onChange={(val) =>
-                            handleUpdateVariantField(index, "price", parseFloat(val) || 0)
+                          onChange={(v) =>
+                            handleUpdateVariantField(idx, "price", parseFloat(v) || 0)
                           }
                           autoComplete="off"
                         />
                       </Grid.Cell>
-                      <Grid.Cell columnSpan={{ xs: 6, sm: 6, md: 4, lg: 4, xl: 4 }}>
+                      <Grid.Cell columnSpan={{ xs: 6, sm: 3, md: 3, lg: 3, xl: 3 }}>
                         <TextField
                           label="Landed Cost ($)"
                           type="number"
                           value={variant.landedCost.toString()}
-                          onChange={(val) =>
-                            handleUpdateVariantField(index, "landedCost", parseFloat(val) || 0)
+                          onChange={(v) =>
+                            handleUpdateVariantField(idx, "landedCost", parseFloat(v) || 0)
                           }
                           autoComplete="off"
                         />
                       </Grid.Cell>
-                      <Grid.Cell columnSpan={{ xs: 6, sm: 6, md: 4, lg: 4, xl: 4 }}>
+                      <Grid.Cell columnSpan={{ xs: 6, sm: 3, md: 3, lg: 3, xl: 3 }}>
                         <TextField
                           label="Stock Quantity"
                           type="number"
                           value={variant.inventoryQuantity.toString()}
-                          onChange={(val) =>
+                          onChange={(v) =>
                             handleUpdateVariantField(
-                              index,
+                              idx,
                               "inventoryQuantity",
-                              parseInt(val, 10) || 0
+                              parseInt(v, 10) || 0
                             )
                           }
                           autoComplete="off"
@@ -1276,7 +1222,7 @@ export default function ImportedProductsPage() {
                       </Grid.Cell>
                     </Grid>
                   </BlockStack>
-                </Card>
+                </Box>
               ))}
             </BlockStack>
           </Modal.Section>

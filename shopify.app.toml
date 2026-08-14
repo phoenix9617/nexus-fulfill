@@ -6,23 +6,23 @@ application_url = "https://nexus-fulfill-1.onrender.com"
 embedded = true
 
 [build]
-automatically_update_urls_on_dev = true
+automatically_update_urls_on_dev = false
 dev_store_url = "nexusfulfill.myshopify.com"
 
 [webhooks]
 api_version = "2026-07"
 
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/orders/create"
-  topics = [ "orders/create" ]
+[[webhooks.subscriptions]]
+uri = "/webhooks/orders/create"
+topics = [ "orders/create" ]
 
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/products/create"
-  topics = [ "products/create" ]
+[[webhooks.subscriptions]]
+uri = "/webhooks/products/create"
+topics = [ "products/create" ]
 
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/app/uninstalled"
-  topics = [ "app/uninstalled" ]
+[[webhooks.subscriptions]]
+uri = "/webhooks/app/uninstalled"
+topics = [ "app/uninstalled" ]
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes

@@ -17,30 +17,48 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   try {
     const rawProductId = String((payload as any)?.id || "");
-    const productGid = `gid://shopify/Product/${rawProductId}`;
+    const numericId = rawProductId.replace("gid://shopify/Product/", "");
+    const productGid = `gid://shopify/Product/${numericId}`;
 
-    // Query db.surgedProduct using shop and product ID matches
+    // Query db.surgedProduct matching all potential ID format variations
     const existingSurgedProduct = await db.surgedProduct.findFirst({
       where: {
         shop,
         OR: [
-          { shopifyProductId: rawProductId },
+          { shopifyProductId: numericId },
           { shopifyProductId: productGid },
+          { shopifyProductId: rawProductId },
         ],
       },
     });
 
-    const isSurged =
-      existingSurgedProduct?.surgeStatus === "AUTO_SURGED" ||
-      existingSurgedProduct?.surgeStatus === "SURGED" ||
-      (existingSurgedProduct?.surgeExpiresAt &&
-        new Date(existingSurgedProduct.surgeExpiresAt) > new Date());
+    if (existingSurgedProduct) {
+      const status = existingSurgedProduct.surgeStatus?.toUpperCase();
+      const hasNotExpired = existingSurgedProduct.surgeExpiresAt
+        ? new Date(existingSurgedProduct.surgeExpiresAt) > new Date()
+        : false;
 
-    if (isSurged) {
+      const isSurged =
+        status === "AUTO_SURGED" ||
+        status === "SURGED" ||
+        status === "ACTIVE" ||
+        status === "ENABLED" ||
+        hasNotExpired;
+
       console.log(
-        `[Webhook products/update] 🛑 BLOCKED SYNC for product ${rawProductId} on ${shop} because surge status is active.`
+        `[Webhook products/update] Record found for product ${numericId} on ${shop}. Status: ${status}, ExpiresAt: ${existingSurgedProduct.surgeExpiresAt}, isSurged: ${isSurged}`
       );
-      return new Response("Ignored: Product pricing is currently surged", { status: 200 });
+
+      if (isSurged) {
+        console.log(
+          `[Webhook products/update] 🛑 BLOCKED SYNC for product ${numericId} on ${shop} because surge status is active.`
+        );
+        return new Response("Ignored: Product pricing is currently surged", { status: 200 });
+      }
+    } else {
+      console.log(
+        `[Webhook products/update] No surgedProduct record found for Product ID: ${numericId}`
+      );
     }
 
     const result = await syncProductFromWebhookPayload({

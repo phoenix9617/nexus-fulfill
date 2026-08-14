@@ -5,9 +5,8 @@ generator client {
 }
 
 datasource db {
-  provider  = "postgresql"
-  url       = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL")
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 // ==========================================
@@ -178,7 +177,7 @@ model ImportedVariant {
   productId        String
   product          ImportedProduct @relation(fields: [productId], references: [id], onDelete: Cascade)
   shopifyVariantId String?         @unique // e.g., "gid://shopify/ProductVariant/987654321"
-  inventoryItemId  String?         // e.g., "gid://shopify/InventoryItem/11223344"
+  inventoryItemId String?         // e.g., "gid://shopify/InventoryItem/11223344"
   cjVid            String?         // CJ Dropshipping Variant ID mapping
   title            String
   sku              String?

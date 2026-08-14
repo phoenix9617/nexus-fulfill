@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import type { LoaderFunctionArgs, ActionFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import { useLoaderData, useFetcher } from "@remix-run/react";
@@ -98,9 +98,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
   if (expiredProducts.length > 0) {
     await Promise.allSettled(
       expiredProducts.map(async (prod) => {
-        const rawOriginal = Number(prod.originalPrice);
+        const rawOriginal = Number(prod.originalPrice || 0);
         const origPrice = roundCurrency(
-          rawOriginal && rawOriginal > 0 ? rawOriginal : Number(prod.currentPrice ?? 0)
+          rawOriginal > 0 ? rawOriginal : Number(prod.currentPrice ?? 0)
         );
 
         if (origPrice <= 0) return;
@@ -158,8 +158,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
         : "NORMAL";
 
     const currentPriceNum = roundCurrency(Number(p.currentPrice ?? 0));
+    const rawOriginalNum = Number(p.originalPrice || 0);
     const originalPriceNum = roundCurrency(
-      Number(p.originalPrice) > 0 ? Number(p.originalPrice) : currentPriceNum
+      rawOriginalNum > 0 ? rawOriginalNum : currentPriceNum
     );
 
     return {
@@ -214,9 +215,9 @@ export async function action({ request }: ActionFunctionArgs) {
         return json<ActionData>({ success: false, message: "Product record not found" }, { status: 404 });
       }
 
-      const rawOriginal = Number(record.originalPrice);
+      const rawOriginal = Number(record.originalPrice || 0);
       const basePrice =
-        rawOriginal && rawOriginal > 0
+        rawOriginal > 0
           ? roundCurrency(rawOriginal)
           : roundCurrency(Number(record.currentPrice ?? 0));
 
@@ -278,9 +279,9 @@ export async function action({ request }: ActionFunctionArgs) {
         return json<ActionData>({ success: false, message: "Product record not found" }, { status: 404 });
       }
 
-      const rawOriginal = Number(record.originalPrice);
+      const rawOriginal = Number(record.originalPrice || 0);
       const originalPriceNum =
-        rawOriginal && rawOriginal > 0
+        rawOriginal > 0
           ? roundCurrency(rawOriginal)
           : roundCurrency(Number(record.currentPrice ?? 0));
 
@@ -376,16 +377,21 @@ export default function PriceSurgeEngine() {
     settings?.autoResetDays?.toString() || "7"
   );
 
+  // Sync settings into state safely when specific values change from loader
+  const thresholdVal = settings?.autoSalesThreshold;
+  const surgePctVal = settings?.autoSurgePercentage;
+  const resetDaysVal = settings?.autoResetDays;
+
   useEffect(() => {
-    if (settings) {
-      const pctStr = settings.autoSurgePercentage?.toString() || "10";
+    if (thresholdVal !== undefined && surgePctVal !== undefined && resetDaysVal !== undefined) {
+      const pctStr = surgePctVal.toString();
       const preset = ["5", "10", "15"].includes(pctStr);
-      setAutoSalesThreshold(settings.autoSalesThreshold?.toString() || "10");
+      setAutoSalesThreshold(thresholdVal.toString());
       setAutoSurgePercentage(preset ? pctStr : "custom");
       setCustomSurgeValue(preset ? "20" : pctStr);
-      setAutoResetDays(settings.autoResetDays?.toString() || "7");
+      setAutoResetDays(resetDaysVal.toString());
     }
-  }, [settings]);
+  }, [thresholdVal, surgePctVal, resetDaysVal]);
 
   const [infoModalOpen, setInfoModalOpen] = useState(false);
   const [selectedProduct, setSelectedProduct] = useState<SurgedProductUI | null>(null);
@@ -394,6 +400,9 @@ export default function PriceSurgeEngine() {
   const [targetProduct, setTargetProduct] = useState<SurgedProductUI | null>(null);
   const [selectedSurgePct, setSelectedSurgePct] = useState("10");
   const [customPctInput, setCustomPctInput] = useState("20");
+
+  // Track intent to reliably trigger modal close on completion
+  const lastActionIntentRef = useRef<string | null>(null);
 
   const tabs = [
     { id: "all", content: "All Surged" },
@@ -418,22 +427,25 @@ export default function PriceSurgeEngine() {
   }, [products, searchValue, selectedTab]);
 
   const isBusy = fetcher.state !== "idle";
-  const isSyncing = isBusy && fetcher.formData?.get("intent") === "sync_products";
-  const isSavingSettings = isBusy && fetcher.formData?.get("intent") === "update_auto_settings";
-  const isApplyingSurge = isBusy && fetcher.formData?.get("intent") === "force_surge";
+  const currentIntent = fetcher.formData?.get("intent")?.toString();
+  const isSyncing = isBusy && currentIntent === "sync_products";
+  const isSavingSettings = isBusy && currentIntent === "update_auto_settings";
+  const isApplyingSurge = isBusy && currentIntent === "force_surge";
   const submittingProductId = fetcher.formData?.get("productId")?.toString();
 
   useEffect(() => {
-    if (
-      fetcher.state === "idle" &&
-      fetcher.data?.success &&
-      surgeModalOpen &&
-      fetcher.formData?.get("intent") === "force_surge"
-    ) {
-      setSurgeModalOpen(false);
-      setTargetProduct(null);
+    if (fetcher.state === "submitting" || fetcher.state === "loading") {
+      lastActionIntentRef.current = currentIntent || null;
     }
-  }, [fetcher.state, fetcher.data, fetcher.formData, surgeModalOpen]);
+
+    if (fetcher.state === "idle" && fetcher.data?.success) {
+      if (lastActionIntentRef.current === "force_surge" && surgeModalOpen) {
+        setSurgeModalOpen(false);
+        setTargetProduct(null);
+      }
+      lastActionIntentRef.current = null;
+    }
+  }, [fetcher.state, fetcher.data, surgeModalOpen, currentIntent]);
 
   const handleSyncProducts = useCallback(() => {
     fetcher.submit({ intent: "sync_products" }, { method: "POST" });
@@ -685,7 +697,7 @@ export default function PriceSurgeEngine() {
                   const isProductStopping =
                     isBusy &&
                     submittingProductId === product.id &&
-                    fetcher.formData?.get("intent") === "stop_surge";
+                    currentIntent === "stop_surge";
 
                   return (
                     <IndexTable.Row id={product.id} key={product.id} position={index}>

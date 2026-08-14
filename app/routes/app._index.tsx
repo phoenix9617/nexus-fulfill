@@ -1,8 +1,12 @@
-// app/routes/app._index.tsx
-
 import type { LoaderFunctionArgs, ActionFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import { useLoaderData, useNavigate, useSubmit, useNavigation } from "@remix-run/react";
+import {
+  useLoaderData,
+  useNavigate,
+  useSubmit,
+  useNavigation,
+  useActionData,
+} from "@remix-run/react";
 import {
   Page,
   Layout,
@@ -15,6 +19,7 @@ import {
   Grid,
   Divider,
   Icon,
+  Banner,
 } from "@shopify/polaris";
 import {
   SearchIcon,
@@ -37,25 +42,36 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     where: { shop },
   });
 
-  // 2. Fetch live metrics from Prisma models
-  const mappedProductsCount = await db.surgedProduct.count({
+  // 2. Fetch live metrics matching the Prisma schema models
+  const mappedProductsCount = await db.vendorMapping.count({
     where: { shop },
   });
 
+  const reroutedLogsCount = await db.rerouteLog.count({
+    where: { shop },
+  });
   const reroutedOrdersCount = await db.fulfilledOrder.count({
     where: { shop, status: "REROUTED" },
   });
+  const totalReroutedCount = reroutedLogsCount + reroutedOrdersCount;
 
   const surgeInterventionsCount = await db.surgedProduct.count({
-    where: { shop, surgeStatus: "AUTO_SURGED" },
+    where: {
+      shop,
+      surgeStatus: {
+        not: "NORMAL",
+      },
+    },
   });
 
-  const isSupplierConnected = Boolean(settings?.cjApiKey);
+  const isSupplierConnected = Boolean(
+    settings?.cjApiKey || settings?.aliExpressToken || settings?.rapidApiKey
+  );
 
   return json({
     metrics: {
       mappedProductsCount,
-      reroutedOrdersCount,
+      reroutedOrdersCount: totalReroutedCount,
       surgeInterventionsCount,
       isSupplierConnected,
     },
@@ -73,50 +89,26 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const result = await syncCJTrackingOrders(shop);
       return json({
         success: true,
-        message: `Synced ${result.updatedCount} orders from supplier.`,
+        message: `Synced ${result?.updatedCount ?? 0} tracking updates from supplier.`,
       });
-    } catch (error: any) {
-      return json(
-        { success: false, error: error.message || "Tracking sync failed." },
-        { status: 500 }
-      );
+    } catch (error: unknown) {
+      const errorMessage =
+        error instanceof Error
+          ? error.message
+          : "Tracking sync failed. Please verify supplier API key configuration.";
+      return json({ success: false, error: errorMessage }, { status: 500 });
     }
   }
 
-  if (intent === "apply_surge" || intent === "manual_surge") {
-    const productId = formData.get("productId") as string;
-    if (!productId) {
-      return json({ success: false, error: "Missing product ID" }, { status: 400 });
-    }
-
-    try {
-      await db.surgedProduct.upsert({
-        where: {
-          id: productId,
-        },
-        create: {
-          shop,
-          shopifyProductId: productId,
-          surgeStatus: "AUTO_SURGED",
-          surgeExpiresAt: new Date(Date.now() + 15 * 60 * 1000),
-        },
-        update: {
-          surgeStatus: "AUTO_SURGED",
-          surgeExpiresAt: new Date(Date.now() + 15 * 60 * 1000),
-        },
-      });
-
-      return json({ success: true, message: "Surge applied and saved to DB." });
-    } catch (error: any) {
-      return json({ success: false, error: error.message }, { status: 500 });
-    }
-  }
-
-  return json({ success: false, error: "Invalid action intent" }, { status: 400 });
+  return json(
+    { success: false, error: "Invalid action intent" },
+    { status: 400 }
+  );
 };
 
 export default function Dashboard() {
   const { metrics } = useLoaderData<typeof loader>();
+  const actionData = useActionData<typeof action>();
   const navigate = useNavigate();
   const submit = useSubmit();
   const navigation = useNavigation();
@@ -134,6 +126,16 @@ export default function Dashboard() {
   return (
     <Page title="NexusFulfill Dashboard">
       <BlockStack gap="500">
+        {/* Action Feedback Banner */}
+        {actionData && (
+          <Banner
+            title={actionData.success ? "Sync Successful" : "Sync Error"}
+            tone={actionData.success ? "success" : "critical"}
+          >
+            <p>{actionData.success ? actionData.message : actionData.error}</p>
+          </Banner>
+        )}
+
         {/* Top Banner / System Status */}
         <Card>
           <BlockStack gap="300">
@@ -146,7 +148,9 @@ export default function Dashboard() {
                   tone={metrics.isSupplierConnected ? "success" : "attention"}
                   progress="complete"
                 >
-                  {metrics.isSupplierConnected ? "Automation Active" : "Setup Required"}
+                  {metrics.isSupplierConnected
+                    ? "Automation Active"
+                    : "Setup Required"}
                 </Badge>
               </InlineStack>
               <InlineStack gap="200">
@@ -167,8 +171,8 @@ export default function Dashboard() {
               </InlineStack>
             </InlineStack>
             <Text as="p" tone="subdued">
-              Automated multi-vendor catalog sync, failover routing, and dynamic price surge
-              protection for your store.
+              Automated multi-vendor catalog sync, failover routing, and dynamic
+              price surge protection for your store.
             </Text>
           </BlockStack>
         </Card>
@@ -204,7 +208,7 @@ export default function Dashboard() {
                   {metrics.reroutedOrdersCount}
                 </Text>
                 <Text variant="bodyXs" tone="subdued" as="span">
-                  Last 30 days
+                  Failover events recorded
                 </Text>
               </BlockStack>
             </Card>
@@ -220,7 +224,7 @@ export default function Dashboard() {
                   {metrics.surgeInterventionsCount}
                 </Text>
                 <Text variant="bodyXs" tone="subdued" as="span">
-                  Cost spikes prevented
+                  Active price surges
                 </Text>
               </BlockStack>
             </Card>
@@ -236,7 +240,9 @@ export default function Dashboard() {
                   {metrics.isSupplierConnected ? "Connected" : "Not Configured"}
                 </Text>
                 <Badge tone={metrics.isSupplierConnected ? "info" : "critical"}>
-                  {metrics.isSupplierConnected ? "CJ / AliExpress" : "Disconnected"}
+                  {metrics.isSupplierConnected
+                    ? "CJ / AliExpress"
+                    : "Disconnected"}
                 </Badge>
               </BlockStack>
             </Card>
@@ -263,7 +269,8 @@ export default function Dashboard() {
                           </Text>
                         </InlineStack>
                         <Text variant="bodySm" tone="subdued" as="p">
-                          Search CJ Dropshipping catalog and import high-margin products directly.
+                          Search CJ Dropshipping catalog and import high-margin
+                          products directly.
                         </Text>
                         <InlineStack align="end">
                           <Button onClick={() => navigate("/app/search")}>
@@ -284,7 +291,8 @@ export default function Dashboard() {
                           </Text>
                         </InlineStack>
                         <Text variant="bodySm" tone="subdued" as="p">
-                          Link Shopify variants to primary and secondary fallback supplier SKUs.
+                          Link Shopify variants to primary and secondary fallback
+                          supplier SKUs.
                         </Text>
                         <InlineStack align="end">
                           <Button onClick={() => navigate("/app/mapping")}>
@@ -305,7 +313,8 @@ export default function Dashboard() {
                           </Text>
                         </InlineStack>
                         <Text variant="bodySm" tone="subdued" as="p">
-                          Review automatically rerouted orders due to stockouts or fulfillment failures.
+                          Review automatically rerouted orders due to stockouts
+                          or fulfillment failures.
                         </Text>
                         <InlineStack align="end">
                           <Button onClick={() => navigate("/app/rerouted")}>
@@ -326,7 +335,8 @@ export default function Dashboard() {
                           </Text>
                         </InlineStack>
                         <Text variant="bodySm" tone="subdued" as="p">
-                          Monitor supplier price hikes and set margins protection thresholds.
+                          Monitor supplier price hikes and set margins
+                          protection thresholds.
                         </Text>
                         <InlineStack align="end">
                           <Button onClick={() => navigate("/app/surged")}>
