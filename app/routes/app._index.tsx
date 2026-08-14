@@ -1,3 +1,4 @@
+// app/routes/app._index.tsx
 import type { LoaderFunctionArgs, ActionFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import {
@@ -90,18 +91,22 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       return json({
         success: true,
         message: `Synced ${result?.updatedCount ?? 0} tracking updates from supplier.`,
+        error: null,
       });
     } catch (error: unknown) {
       const errorMessage =
         error instanceof Error
           ? error.message
           : "Tracking sync failed. Please verify supplier API key configuration.";
-      return json({ success: false, error: errorMessage }, { status: 500 });
+      return json(
+        { success: false, message: null, error: errorMessage },
+        { status: 500 }
+      );
     }
   }
 
   return json(
-    { success: false, error: "Invalid action intent" },
+    { success: false, message: null, error: "Invalid action intent" },
     { status: 400 }
   );
 };
@@ -339,7 +344,7 @@ export default function Dashboard() {
                           protection thresholds.
                         </Text>
                         <InlineStack align="end">
-                          <Button onClick={() => navigate("/app/surged")}>
+                          <Button onClick={() => navigate("/app/price-surge-engine")}>
                             Open Surge Engine
                           </Button>
                         </InlineStack>

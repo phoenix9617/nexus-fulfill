@@ -1,8 +1,7 @@
-// app/routes/app.price-surge.tsx
-
+// app/routes/app.price-surge-engine.tsx
 import { json, type ActionFunctionArgs, type LoaderFunctionArgs } from "@remix-run/node";
-import { useActionData, useLoaderData, useSubmit, useNavigation, Form } from "@remix-run/react";
-import { useState } from "react";
+import { useActionData, useLoaderData, useNavigation, Form } from "@remix-run/react";
+import { useState, useEffect } from "react";
 import {
   Page,
   Layout,
@@ -14,9 +13,24 @@ import {
   InlineStack,
   Text,
   Select,
+  Badge,
 } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 import db from "../db.server";
+
+interface ProductVariantNode {
+  id: string;
+  title: string;
+  price: string;
+}
+
+interface ProductNode {
+  id: string;
+  title: string;
+  variants: {
+    nodes: ProductVariantNode[];
+  };
+}
 
 // ----------------------------------------------------------------------
 // LOADER: Fetch active products and surge records
@@ -28,17 +42,18 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // 1. Fetch active surge records from PostgreSQL
   const activeSurges = await db.surgedProduct.findMany({
     where: { shop },
+    orderBy: { updatedAt: "desc" },
   });
 
   // 2. Fetch products from Shopify Admin GraphQL API
   const response = await admin.graphql(`
     #graphql
     query getProducts {
-      products(first: 20) {
+      products(first: 50) {
         nodes {
           id
           title
-          variants(first: 5) {
+          variants(first: 10) {
             nodes {
               id
               title
@@ -51,7 +66,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   `);
 
   const responseJson = await response.json();
-  const products = responseJson.data?.products?.nodes || [];
+  const products: ProductNode[] = responseJson.data?.products?.nodes || [];
 
   return json({ shop, products, activeSurges });
 };
@@ -71,22 +86,22 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const durationHours = parseInt((formData.get("durationHours") as string) || "1", 10);
 
   if (!rawProductId || !rawVariantId || !newPrice) {
-    return json({ success: false, error: "Missing required fields." }, { status: 400 });
+    return json({ success: false, error: "Missing required form fields." }, { status: 400 });
   }
 
   // Normalize ID formats
   const numericProductId = rawProductId.replace("gid://shopify/Product/", "");
   const productGid = `gid://shopify/Product/${numericProductId}`;
-  const variantGid = rawVariantId.startsWith("gid://") 
-    ? rawVariantId 
-    : `gid://shopify/ProductVariant/${rawVariantId}`;
+  
+  const numericVariantId = rawVariantId.replace("gid://shopify/ProductVariant/", "");
+  const variantGid = `gid://shopify/ProductVariant/${numericVariantId}`;
 
   // Calculate surge expiration timestamp in UTC
   const surgeExpiresAt = new Date(Date.now() + durationHours * 60 * 60 * 1000);
 
   try {
     // ------------------------------------------------------------------
-    // STEP 1: WRITE TO DATABASE FIRST (Surge Guard Pre-registration)
+    // STEP 1: WRITE TO DATABASE FIRST (Pre-write Surge Guard)
     // ------------------------------------------------------------------
     const existing = await db.surgedProduct.findFirst({
       where: {
@@ -165,11 +180,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     return json({
       success: true,
-      message: `Surge applied! Price updated to $${newPrice} for ${durationHours} hour(s).`,
+      message: `Surge applied! Variant price updated to $${newPrice} for ${durationHours} hour(s).`,
     });
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const errMessage = error instanceof Error ? error.message : "Failed to apply surge.";
     console.error("[Price Surge] Exception:", error);
-    return json({ success: false, error: error.message || "Failed to apply surge." }, { status: 500 });
+    return json({ success: false, error: errMessage }, { status: 500 });
   }
 };
 
@@ -187,11 +203,18 @@ export default function PriceSurgePage() {
   const [surgePrice, setSurgePrice] = useState<string>("");
   const [durationHours, setDurationHours] = useState<string>("1");
 
-  const selectedProduct = products.find((p: any) => p.id === selectedProductId);
-  const selectedVariant = selectedProduct?.variants?.nodes?.find((v: any) => v.id === selectedVariantId);
+  // Reset form inputs after successful submission
+  useEffect(() => {
+    if (actionData?.success) {
+      setSurgePrice("");
+    }
+  }, [actionData]);
 
-  const productOptions = products.map((p: any) => ({ label: p.title, value: p.id }));
-  const variantOptions = (selectedProduct?.variants?.nodes || []).map((v: any) => ({
+  const selectedProduct = products.find((p) => p.id === selectedProductId);
+  const selectedVariant = selectedProduct?.variants?.nodes?.find((v) => v.id === selectedVariantId);
+
+  const productOptions = products.map((p) => ({ label: p.title, value: p.id }));
+  const variantOptions = (selectedProduct?.variants?.nodes || []).map((v) => ({
     label: `${v.title} ($${v.price})`,
     value: v.id,
   }));
@@ -206,14 +229,16 @@ export default function PriceSurgePage() {
 
   const handleProductChange = (val: string) => {
     setSelectedProductId(val);
-    const prod = products.find((p: any) => p.id === val);
+    const prod = products.find((p) => p.id === val);
     if (prod?.variants?.nodes?.[0]) {
       setSelectedVariantId(prod.variants.nodes[0].id);
+    } else {
+      setSelectedVariantId("");
     }
   };
 
   return (
-    <Page title="Price Surge Engine" subtitle="Apply temporary price bumps across catalog items.">
+    <Page title="Price Surge Engine" subtitle="Apply temporary price bumps across catalog items with webhook protection.">
       <Layout>
         <Layout.Section>
           <BlockStack gap="400">
@@ -236,59 +261,70 @@ export default function PriceSurgePage() {
                     Create Price Surge Rule
                   </Text>
 
-                  <Select
-                    label="Select Product"
-                    options={productOptions}
-                    value={selectedProductId}
-                    onChange={handleProductChange}
-                  />
+                  {products.length === 0 ? (
+                    <Text as="p" tone="subdued">
+                      No products found in your Shopify store.
+                    </Text>
+                  ) : (
+                    <>
+                      <Select
+                        label="Select Product"
+                        options={productOptions}
+                        value={selectedProductId}
+                        onChange={handleProductChange}
+                      />
 
-                  <Select
-                    label="Select Variant"
-                    options={variantOptions}
-                    value={selectedVariantId}
-                    onChange={(val) => setSelectedVariantId(val)}
-                  />
+                      <Select
+                        label="Select Variant"
+                        options={variantOptions}
+                        value={selectedVariantId}
+                        onChange={(val) => setSelectedVariantId(val)}
+                        disabled={variantOptions.length === 0}
+                      />
 
-                  <InlineStack gap="300">
-                    <TextField
-                      label="Current Price"
-                      value={selectedVariant?.price ? `$${selectedVariant.price}` : ""}
-                      disabled
-                      autoComplete="off"
-                    />
+                      <InlineStack gap="300">
+                        <TextField
+                          label="Current Price"
+                          value={selectedVariant?.price ? `$${selectedVariant.price}` : "$0.00"}
+                          disabled
+                          autoComplete="off"
+                        />
 
-                    <TextField
-                      label="New Surged Price ($)"
-                      type="number"
-                      name="surgePrice"
-                      value={surgePrice}
-                      onChange={(val) => setSurgePrice(val)}
-                      placeholder="e.g. 49.99"
-                      autoComplete="off"
-                    />
-                  </InlineStack>
+                        <TextField
+                          label="New Surged Price ($)"
+                          type="number"
+                          name="surgePrice"
+                          value={surgePrice}
+                          onChange={(val) => setSurgePrice(val)}
+                          placeholder="e.g. 49.99"
+                          autoComplete="off"
+                        />
+                      </InlineStack>
 
-                  <Select
-                    label="Surge Duration"
-                    name="durationHours"
-                    options={durationOptions}
-                    value={durationHours}
-                    onChange={(val) => setDurationHours(val)}
-                  />
+                      <Select
+                        label="Surge Duration"
+                        name="durationHours"
+                        options={durationOptions}
+                        value={durationHours}
+                        onChange={(val) => setDurationHours(val)}
+                      />
 
-                  <input type="hidden" name="productId" value={selectedProductId} />
-                  <input type="hidden" name="variantId" value={selectedVariantId} />
-                  <input type="hidden" name="originalPrice" value={selectedVariant?.price || "0"} />
+                      <input type="hidden" name="productId" value={selectedProductId} />
+                      <input type="hidden" name="variantId" value={selectedVariantId} />
+                      <input type="hidden" name="originalPrice" value={selectedVariant?.price || "0"} />
 
-                  <Button
-                    submit
-                    variant="primary"
-                    loading={isSubmitting}
-                    disabled={!surgePrice || isSubmitting}
-                  >
-                    Apply Price Surge
-                  </Button>
+                      <InlineStack align="end">
+                        <Button
+                          submit
+                          variant="primary"
+                          loading={isSubmitting}
+                          disabled={!surgePrice || !selectedVariantId || isSubmitting}
+                        >
+                          Apply Price Surge
+                        </Button>
+                      </InlineStack>
+                    </>
+                  )}
                 </BlockStack>
               </Form>
             </Card>
@@ -300,17 +336,32 @@ export default function PriceSurgePage() {
                 </Text>
                 {activeSurges.length === 0 ? (
                   <Text as="p" tone="subdued">
-                    No active surges recorded in database.
+                    No active price surges recorded in the database.
                   </Text>
                 ) : (
-                  activeSurges.map((surge: any) => (
-                    <InlineStack key={surge.id} align="space-between">
-                      <Text as="span">Product ID: {surge.shopifyProductId}</Text>
-                      <Text as="span" tone="success">
-                        Status: {surge.surgeStatus} (Expires: {new Date(surge.surgeExpiresAt).toLocaleTimeString()})
-                      </Text>
-                    </InlineStack>
-                  ))
+                  activeSurges.map((surge) => {
+                    const isExpired = new Date(surge.surgeExpiresAt) < new Date();
+                    return (
+                      <InlineStack key={surge.id} align="space-between" blockAlign="center">
+                        <BlockStack gap="100">
+                          <Text as="span" fontWeight="bold">
+                            Product ID: {surge.shopifyProductId}
+                          </Text>
+                          <Text as="span" variant="bodyXs" tone="subdued">
+                            Surged Price: ${surge.surgedPrice?.toFixed(2) ?? "N/A"} | Original: ${surge.originalPrice?.toFixed(2) ?? "N/A"}
+                          </Text>
+                        </BlockStack>
+                        <InlineStack gap="200" blockAlign="center">
+                          <Badge tone={isExpired ? "attention" : "success"}>
+                            {isExpired ? "EXPIRED" : surge.surgeStatus}
+                          </Badge>
+                          <Text as="span" variant="bodyXs" tone="subdued">
+                            Expires: {new Date(surge.surgeExpiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </Text>
+                        </InlineStack>
+                      </InlineStack>
+                    );
+                  })
                 )}
               </BlockStack>
             </Card>
