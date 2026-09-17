@@ -1,4 +1,4 @@
-// Prisma Schema — NexusFulfill
+// Prisma Schema — Dead Stock Clearance & Multi-Supplier Suite
 
 generator client {
   provider = "prisma-client-js"
@@ -33,6 +33,74 @@ model Session {
   refreshTokenExpires DateTime?
 
   @@index([shop])
+}
+
+// ==========================================
+// Dead Stock Clearance Automation Models
+// ==========================================
+
+model MerchantSetting {
+  id                  String    @id @default(uuid())
+  shop                String?   @unique
+
+  // Automation Triggers
+  isEnabled           Boolean   @default(false)
+  inactivityDays      Int       @default(30)
+  maxSalesThreshold   Int       @default(0)
+
+  // Discount Settings
+  discountType        String    @default("PERCENTAGE") // "PERCENTAGE" | "FIXED_AMOUNT"
+  discountValue       Float     @default(15.0)
+  durationDays        Int       @default(7)
+  applyCompareAtPrice Boolean   @default(true)
+
+  // Marketing Channel Toggles & Credentials
+  enableEmail         Boolean   @default(false)
+  merchantEmail       String?
+  emailApiKey         String?
+  emailFromAddress    String?
+
+  enableSocial        Boolean   @default(false)
+  socialWebhookUrl    String?
+  socialTemplateId    String?   @default("URGENCY_DEAL")
+  customSocialMessage String?   @default("")
+
+  // System Timestamps
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  // Relations
+  salesLogs           AutomatedSaleLog[]
+}
+
+model AutomatedSaleLog {
+  id                String           @id @default(uuid())
+  shop              String?
+
+  settingId         String?
+  setting           MerchantSetting? @relation(fields: [settingId], references: [id], onDelete: Cascade)
+
+  productId         String
+  variantId         String?
+  productTitle      String
+
+  originalPrice     Float
+  discountedPrice   Float
+  unitsSoldInWindow Int              @default(0)
+
+  status            String           @default("ACTIVE") // "ACTIVE" | "REVERTED" | "MANUAL_REVERT" | "EXPIRED"
+  durationDays      Int              @default(7)
+  endsAt            DateTime?
+
+  socialPosted      Boolean          @default(false)
+  emailSent         Boolean          @default(false)
+
+  appliedAt         DateTime         @default(now())
+  revertedAt        DateTime?
+
+  @@index([settingId])
+  @@index([shop])
+  @@index([productId])
 }
 
 // ==========================================
@@ -177,7 +245,7 @@ model ImportedVariant {
   productId        String
   product          ImportedProduct @relation(fields: [productId], references: [id], onDelete: Cascade)
   shopifyVariantId String?         @unique // e.g., "gid://shopify/ProductVariant/987654321"
-  inventoryItemId String?         // e.g., "gid://shopify/InventoryItem/11223344"
+  inventoryItemId  String?         // e.g., "gid://shopify/InventoryItem/11223344"
   cjVid            String?         // CJ Dropshipping Variant ID mapping
   title            String
   sku              String?
