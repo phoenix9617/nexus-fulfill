@@ -1,8 +1,7 @@
 // app/routes/app.settings.tsx
 
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { json } from "@remix-run/node";
-import { useLoaderData, useActionData, useSubmit, useNavigation } from "@remix-run/react";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { useLoaderData, useActionData, useSubmit, useNavigation } from "react-router";
 import { useState, useCallback, useEffect } from "react";
 import {
   Page,
@@ -22,12 +21,18 @@ import { TitleBar } from "@shopify/app-bridge-react";
 import db from "../db.server";
 import { authenticate } from "../shopify.server";
 
+// Normalizes shop string regardless of session prefix
+const cleanShop = (s: string) => s.replace(/^offline_/, "");
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const shop = session.shop;
+  const rawShop = session.shop || "";
+  const shop = cleanShop(rawShop);
 
-  let settings = await db.appSettings.findUnique({
-    where: { shop },
+  let settings = await db.appSettings.findFirst({
+    where: {
+      shop: { contains: shop },
+    },
   });
 
   if (!settings) {
@@ -38,11 +43,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     });
   }
 
-  const surgeSetting = await db.surgeSetting.findUnique({
-    where: { shop },
+  const surgeSetting = await db.surgeSetting.findFirst({
+    where: {
+      shop: { contains: shop },
+    },
   });
 
-  return json({
+  return Response.json({
     settings: {
       cjEmail: settings.cjEmail || "",
       cjApiKey: settings.cjApiKey || "",
@@ -64,7 +71,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const shop = session.shop;
+  const rawShop = session.shop || "";
+  const shop = cleanShop(rawShop);
   const formData = await request.formData();
 
   // App Settings Inputs
@@ -84,15 +92,24 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   // Validation
   if (isNaN(marginThreshold) || marginThreshold < 0) {
-    return json({ success: false, error: "Margin threshold must be a valid non-negative number." }, { status: 400 });
+    return Response.json(
+      { success: false, error: "Margin threshold must be a valid non-negative number." },
+      { status: 400 }
+    );
   }
 
   if (isNaN(autoSalesThreshold) || autoSalesThreshold < 1) {
-    return json({ success: false, error: "Sales threshold must be at least 1 order." }, { status: 400 });
+    return Response.json(
+      { success: false, error: "Sales threshold must be at least 1 order." },
+      { status: 400 }
+    );
   }
 
   if (isNaN(autoSurgePercentage) || autoSurgePercentage < 0) {
-    return json({ success: false, error: "Surge percentage must be a non-negative number." }, { status: 400 });
+    return Response.json(
+      { success: false, error: "Surge percentage must be a non-negative number." },
+      { status: 400 }
+    );
   }
 
   try {
@@ -138,11 +155,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       },
     });
 
-    return json({ success: true, error: null });
+    return Response.json({ success: true, error: null });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "An unexpected error occurred while saving settings.";
     console.error("[Settings Action Error]:", error);
-    return json({ success: false, error: message }, { status: 500 });
+    return Response.json({ success: false, error: message }, { status: 500 });
   }
 };
 

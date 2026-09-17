@@ -1,7 +1,13 @@
 import { useState, useEffect } from "react";
 import type { LoaderFunctionArgs, ActionFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import { useLoaderData, useFetcher, Form, useSubmit, useNavigate } from "@remix-run/react";
+import {
+  useLoaderData,
+  useFetcher,
+  Form,
+  useSubmit,
+  useNavigate,
+} from "@remix-run/react";
 import {
   Page,
   Layout,
@@ -18,12 +24,10 @@ import {
   Banner,
   Box,
   Divider,
-  Checkbox,
   EmptyState,
 } from "@shopify/polaris";
 import {
   SearchIcon,
-  RefreshIcon,
   ImportIcon,
   EditIcon,
 } from "@shopify/polaris-icons";
@@ -31,7 +35,6 @@ import { authenticate } from "../shopify.server";
 import db from "../db.server";
 
 // --- Types ---
-
 interface VariantOption {
   name: string;
   value: string;
@@ -67,33 +70,93 @@ interface ImportedProduct {
   variants: ImportedVariant[];
 }
 
-// --- Helper Functions ---
+interface EditableVariantState {
+  variantId: string;
+  shopifyVariantId?: string;
+  name: string;
+  sku: string;
+  originalPrice: string;
+  price: string;
+  landedCost: string;
+  inventoryQuantity: string;
+}
 
+// --- Helper Functions ---
 async function syncProductToShopify(
   admin: any,
   shopifyProductId: string,
   variants: Array<{ shopifyVariantId?: string; price: number }>
 ) {
   if (!shopifyProductId || shopifyProductId.includes("Unlinked")) {
-    return { success: false, reason: "Unlinked product" };
+    return { success: false, reason: "Product is not linked to Shopify." };
   }
 
-  const variantsToUpdate = variants
-    .filter((v) => v.shopifyVariantId)
+  const formattedProductId = shopifyProductId.startsWith("gid://shopify/Product/")
+    ? shopifyProductId
+    : `gid://shopify/Product/${shopifyProductId}`;
+
+  let variantsToUpdate = variants
+    .filter((v) => v.shopifyVariantId && Number.isFinite(v.price) && v.price >= 0)
     .map((v) => ({
-      id: v.shopifyVariantId as string,
-      price: v.price.toFixed(2),
+      id: v.shopifyVariantId!.startsWith("gid://shopify/ProductVariant/")
+        ? v.shopifyVariantId!
+        : `gid://shopify/ProductVariant/${v.shopifyVariantId}`,
+      price: Number(v.price).toFixed(2),
     }));
 
-  if (variantsToUpdate.length === 0) {
-    return { success: false, reason: "No Shopify variant IDs found" };
-  }
-
   try {
+    if (variantsToUpdate.length === 0) {
+      const liveRes = await admin.graphql(
+        `#graphql
+        query getLiveVariants($id: ID!) {
+          product(id: $id) {
+            variants(first: 50) {
+              edges {
+                node {
+                  id
+                  price
+                }
+              }
+            }
+          }
+        }`,
+        { variables: { id: formattedProductId } }
+      );
+
+      const liveData = await liveRes.json();
+
+      if (liveData.errors?.length) {
+        return {
+          success: false,
+          reason: liveData.errors[0]?.message || "Shopify query failed.",
+        };
+      }
+
+      const liveEdges = liveData.data?.product?.variants?.edges || [];
+
+      if (liveEdges.length === 0) {
+        return { success: false, reason: "Could not locate variants on Shopify." };
+      }
+
+      variantsToUpdate = liveEdges.map((edge: any, idx: number) => {
+        const targetPrice = variants[idx]?.price ?? parseFloat(edge.node.price || "0");
+        return {
+          id: edge.node.id,
+          price: Number(targetPrice).toFixed(2),
+        };
+      });
+    }
+
     const response = await admin.graphql(
       `#graphql
-      mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-        productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+      mutation productVariantsBulkUpdate(
+        $productId: ID!,
+        $variants: [ProductVariantsBulkInput!]!
+      ) {
+        productVariantsBulkUpdate(
+          productId: $productId,
+          variants: $variants
+        ) {
           productVariants {
             id
             price
@@ -106,49 +169,175 @@ async function syncProductToShopify(
       }`,
       {
         variables: {
-          productId: shopifyProductId,
+          productId: formattedProductId,
           variants: variantsToUpdate,
         },
       }
     );
 
     const resJson = await response.json();
-    const userErrors = resJson.data?.productVariantsBulkUpdate?.userErrors || [];
-    if (userErrors.length > 0) {
-      console.error("Shopify GraphQL errors updating variants:", userErrors);
-      return { success: false, errors: userErrors };
+
+    if (resJson.errors?.length) {
+      return {
+        success: false,
+        reason: resJson.errors.map((e: any) => e.message).join(", "),
+      };
     }
+
+    const mutation = resJson.data?.productVariantsBulkUpdate;
+
+    if (!mutation) {
+      return { success: false, reason: "Shopify returned no mutation result." };
+    }
+
+    if (mutation.userErrors?.length) {
+      return {
+        success: false,
+        reason: mutation.userErrors.map((e: any) => e.message).join(", "),
+      };
+    }
+
+    // Verify the exact prices Shopify returned.
+    for (const requested of variantsToUpdate) {
+      const returned = (mutation.productVariants || []).find(
+        (v: any) => v.id === requested.id
+      );
+
+      if (!returned) {
+        return {
+          success: false,
+          reason: `Shopify did not return variant ${requested.id}.`,
+        };
+      }
+
+      if (Math.abs(Number(returned.price) - Number(requested.price)) > 0.001) {
+        return {
+          success: false,
+          reason: `Shopify returned $${returned.price} instead of $${requested.price}.`,
+        };
+      }
+    }
+
+    console.log("[Catalog Sync] Shopify price update verified:", {
+      productId: formattedProductId,
+      variants: variantsToUpdate,
+    });
+
     return { success: true };
-  } catch (error) {
-    console.error("Failed to execute Shopify GraphQL mutation:", error);
-    return { success: false, error };
+  } catch (error: any) {
+    console.error("[Catalog Sync] Shopify mutation failed:", error);
+    return { success: false, reason: error?.message || "Failed mutation." };
   }
 }
 
-// --- Loader ---
+async function ensureProductInDb(admin: any, session: any, productId: string) {
+  const fullGid = productId.startsWith("gid://shopify/Product/")
+    ? productId
+    : `gid://shopify/Product/${productId}`;
+  const cleanId = productId.replace("gid://shopify/Product/", "");
 
+  let product = await db.importedProduct.findFirst({
+    where: {
+      shop: session.shop,
+      OR: [
+        { shopifyProductId: fullGid },
+        { shopifyProductId: cleanId },
+        { id: productId },
+      ],
+    },
+    include: { variants: true },
+  });
+
+  if (!product) {
+    const gqRes = await admin.graphql(
+      `#graphql
+      query getProduct($id: ID!) {
+        product(id: $id) {
+          id
+          title
+          productType
+          vendor
+          featuredImage { url }
+          variants(first: 50) {
+            edges {
+              node {
+                id
+                title
+                price
+                sku
+                inventoryQuantity
+              }
+            }
+          }
+        }
+      }`,
+      { variables: { id: fullGid } }
+    );
+    const gqData = await gqRes.json();
+    const pNode = gqData.data?.product;
+
+    if (pNode) {
+      const firstVariant = pNode.variants?.edges[0]?.node;
+      const initPrice = parseFloat(firstVariant?.price || "0");
+
+      product = await db.importedProduct.create({
+        data: {
+          shop: session.shop,
+          shopifyProductId: pNode.id,
+          supplierProductId: pNode.id,
+          title: pNode.title,
+          category: pNode.productType || "General Store",
+          vendor: pNode.vendor || "Store Catalog",
+          retailPrice: initPrice,
+          landedCost: Number((initPrice * 0.65).toFixed(2)),
+          sku: firstVariant?.sku || "SKU-NOT-SET",
+          image: pNode.featuredImage?.url || "",
+          syncStatus: "synced",
+          activeSurgePercentage: 0,
+          variants: {
+            create: (pNode.variants?.edges || []).map((vEdge: any) => {
+              const vp = parseFloat(vEdge.node.price || "0");
+              return {
+                shopifyVariantId: vEdge.node.id,
+                title: vEdge.node.title,
+                price: vp,
+                originalPrice: vp,
+                landedCost: Number((vp * 0.65).toFixed(2)),
+                sku: vEdge.node.sku || "VAR-SKU",
+                stockQuantity: vEdge.node.inventoryQuantity || 0,
+              };
+            }),
+          },
+        },
+        include: { variants: true },
+      });
+    }
+  }
+
+  if (product && product.shopifyProductId !== fullGid) {
+    await db.importedProduct.update({
+      where: { id: product.id },
+      data: { shopifyProductId: fullGid },
+    });
+    product.shopifyProductId = fullGid;
+  }
+
+  return product;
+}
+
+// --- Loader ---
 export async function loader({ request }: LoaderFunctionArgs) {
   const { admin, session } = await authenticate.admin(request);
   const url = new URL(request.url);
   const searchQuery = url.searchParams.get("query") || "";
-
   let importedProducts: ImportedProduct[] = [];
 
   try {
-    // 1. Fetch DB records first so app-imported products are never missed
-    const shopDomain = session.shop.split(".")[0];
     const dbRecords = await db.importedProduct.findMany({
-      where: {
-        OR: [
-          { shop: session.shop },
-          { shop: { contains: shopDomain } },
-        ],
-      },
       include: { variants: true },
       orderBy: { updatedAt: "desc" },
     });
 
-    // 2. Query store items from Shopify GraphQL
     const shopifyResponse = await admin.graphql(
       `#graphql
       query getStoreProducts {
@@ -159,9 +348,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
               title
               productType
               vendor
-              featuredImage {
-                url
-              }
+              featuredImage { url }
               variants(first: 50) {
                 edges {
                   node {
@@ -181,40 +368,66 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
     const resJson = await shopifyResponse.json();
     const shopifyProducts = resJson.data?.products?.edges || [];
-    const shopifyMap = new Map(shopifyProducts.map((edge: any) => [edge.node.id, edge.node]));
 
-    // 3. Process DB records first
+    const shopifyMap = new Map();
+    for (const edge of shopifyProducts) {
+      const node = edge.node;
+      shopifyMap.set(node.id, node);
+      const rawId = node.id.replace("gid://shopify/Product/", "");
+      shopifyMap.set(rawId, node);
+    }
+
+    const processedShopifyIds = new Set<string>();
+
     for (const record of dbRecords) {
-      const shopifyMatch = record.shopifyProductId ? shopifyMap.get(record.shopifyProductId) : null;
+      const fullGid = record.shopifyProductId?.startsWith("gid://shopify/Product/")
+        ? record.shopifyProductId
+        : record.shopifyProductId
+        ? `gid://shopify/Product/${record.shopifyProductId}`
+        : "";
+
+      if (fullGid) processedShopifyIds.add(fullGid);
+      if (record.shopifyProductId) processedShopifyIds.add(record.shopifyProductId);
+
+      const shopifyMatch =
+        shopifyMap.get(record.shopifyProductId) || shopifyMap.get(fullGid);
       const activeSurge = record.activeSurgePercentage || 0;
       const currentRetail = record.retailPrice || 0;
-
       const firstVariant = record.variants?.[0];
-      const originalRetail =
+
+      let originalRetail =
         firstVariant?.originalPrice && firstVariant.originalPrice > 0
           ? firstVariant.originalPrice
-          : activeSurge > 0
-          ? Number((currentRetail / (1 + activeSurge / 100)).toFixed(2))
           : currentRetail;
 
-      const mappedVariants: ImportedVariant[] = (record.variants || []).map((v) => ({
-        variantId: v.id,
-        name: v.title,
-        options: [{ name: "Variant", value: v.title }],
-        price: v.price,
-        originalPrice: v.originalPrice && v.originalPrice > 0 ? v.originalPrice : v.price,
-        landedCost: v.landedCost || 0,
-        sku: v.sku || "VAR-SKU",
-        inventoryQuantity: v.stockQuantity || 0,
-        shopifyVariantId: v.shopifyVariantId || undefined,
-      }));
+      if (activeSurge > 0 && originalRetail === currentRetail) {
+        originalRetail = Number(
+          (currentRetail / (1 + activeSurge / 100)).toFixed(2)
+        );
+      }
+
+      const mappedVariants: ImportedVariant[] = (record.variants || []).map(
+        (v) => ({
+          variantId: v.id,
+          name: v.title,
+          options: [{ name: "Variant", value: v.title }],
+          price: v.price,
+          originalPrice:
+            v.originalPrice && v.originalPrice > 0 ? v.originalPrice : v.price,
+          landedCost: v.landedCost || 0,
+          sku: v.sku || "VAR-SKU",
+          inventoryQuantity: v.stockQuantity || 0,
+          shopifyVariantId: v.shopifyVariantId || undefined,
+        })
+      );
 
       importedProducts.push({
-        id: record.id,
-        shopifyProductId: record.shopifyProductId || "Unlinked",
+        id: fullGid || record.id,
+        shopifyProductId: fullGid || "Unlinked",
         supplierProductId: record.id,
         title: record.title || shopifyMatch?.title || "Untitled Product",
-        category: record.category || shopifyMatch?.productType || "General Hardware",
+        category:
+          record.category || shopifyMatch?.productType || "General Store",
         supplier: record.vendor || shopifyMatch?.vendor || "Supplier Catalog",
         retailPrice: currentRetail,
         originalRetailPrice: originalRetail,
@@ -224,7 +437,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
           record.image ||
           shopifyMatch?.featuredImage?.url ||
           "https://images.unsplash.com/photo-1591799264318-7e6ef8ddb7ea?auto=format&fit=crop&w=600&q=80",
-        syncStatus: (record.syncStatus as "synced" | "pending" | "error") || (record.shopifyProductId ? "synced" : "pending"),
+        syncStatus:
+          (record.syncStatus as "synced" | "pending" | "error") || "synced",
         lastSyncedAt: record.updatedAt
           ? new Date(record.updatedAt).toISOString().split("T")[0]
           : "Not Synced",
@@ -233,12 +447,11 @@ export async function loader({ request }: LoaderFunctionArgs) {
       });
     }
 
-    // 4. Auto-include native store products not yet saved to local DB
     for (const edge of shopifyProducts) {
       const pNode = edge.node;
-      const existsInDb = dbRecords.some((r) => r.shopifyProductId === pNode.id);
+      const rawId = pNode.id.replace("gid://shopify/Product/", "");
 
-      if (!existsInDb) {
+      if (!processedShopifyIds.has(pNode.id) && !processedShopifyIds.has(rawId)) {
         const firstVariant = pNode.variants?.edges[0]?.node;
         const price = parseFloat(firstVariant?.price || "0");
 
@@ -247,7 +460,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
           shopifyProductId: pNode.id,
           supplierProductId: pNode.id,
           title: pNode.title,
-          category: pNode.productType || "General Hardware",
+          category: pNode.productType || "General Store",
           supplier: pNode.vendor || "Store Catalog",
           retailPrice: price,
           originalRetailPrice: price,
@@ -265,7 +478,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
             options: [{ name: "Variant", value: vEdge.node.title }],
             price: parseFloat(vEdge.node.price || "0"),
             originalPrice: parseFloat(vEdge.node.price || "0"),
-            landedCost: Number((parseFloat(vEdge.node.price || "0") * 0.65).toFixed(2)),
+            landedCost: Number(
+              (parseFloat(vEdge.node.price || "0") * 0.65).toFixed(2)
+            ),
             sku: vEdge.node.sku || "VAR-SKU",
             inventoryQuantity: vEdge.node.inventoryQuantity || 0,
             shopifyVariantId: vEdge.node.id,
@@ -295,155 +510,135 @@ export async function loader({ request }: LoaderFunctionArgs) {
 }
 
 // --- Action ---
-
 export async function action({ request }: ActionFunctionArgs) {
   const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
   const intent = formData.get("intent");
 
-  if (intent === "updateProduct") {
-    const productId = formData.get("productId") as string;
-    const title = formData.get("title") as string;
-    const category = formData.get("category") as string;
-    const variantsRaw = formData.get("variants") as string;
-    const variantsData: Array<{
-      variantId: string;
-      name: string;
-      sku: string;
-      originalPrice: number;
-      price: number;
-      landedCost: number;
-      inventoryQuantity: number;
-    }> = JSON.parse(variantsRaw || "[]");
-
-    try {
-      const product = await db.importedProduct.findUnique({
-        where: { id: productId },
-        include: { variants: true },
-      });
-
-      if (product) {
-        const primaryVar = variantsData[0];
-        const primaryPrice = primaryVar ? primaryVar.price : product.retailPrice;
-        const primaryLandedCost = primaryVar ? primaryVar.landedCost : product.landedCost;
-
-        await db.importedProduct.update({
-          where: { id: productId },
-          data: {
-            title,
-            category,
-            retailPrice: primaryPrice,
-            landedCost: primaryLandedCost,
-            syncStatus: "synced",
-          },
-        });
-
-        for (const v of variantsData) {
-          await db.importedVariant.update({
-            where: { id: v.variantId },
-            data: {
-              title: v.name,
-              sku: v.sku,
-              originalPrice: v.originalPrice,
-              price: v.price,
-              landedCost: v.landedCost,
-              stockQuantity: v.inventoryQuantity,
-            },
-          });
-        }
-
-        if (product.shopifyProductId && !product.shopifyProductId.includes("Unlinked")) {
-          await admin.graphql(
-            `#graphql
-            mutation productUpdate($input: ProductInput!) {
-              productUpdate(input: $input) {
-                product { id title }
-                userErrors { field message }
-              }
-            }`,
-            {
-              variables: {
-                input: {
-                  id: product.shopifyProductId,
-                  title: title,
-                  productType: category,
-                },
-              },
-            }
-          );
-
-          const shopifyVariantsPayload = variantsData.map((v) => {
-            const dbVar = product.variants.find((vDb) => vDb.id === v.variantId);
-            return {
-              shopifyVariantId: dbVar?.shopifyVariantId || undefined,
-              price: v.price,
-            };
-          });
-
-          await syncProductToShopify(admin, product.shopifyProductId, shopifyVariantsPayload);
-        }
-      }
-    } catch (error) {
-      console.error("Failed to update product details:", error);
-      return json({ success: false, error: "Failed to update product." }, { status: 500 });
-    }
-
-    return json({ success: true, updatedProductId: productId, actionType: "edited" });
-  }
-
   if (intent === "forceSurge") {
     const productId = formData.get("productId") as string;
-    const surgePercentage = parseFloat(formData.get("surgePercentage") as string) || 0;
+    const surgePercentage = Number(formData.get("surgePercentage"));
+
+    if (!productId) {
+      return json({ success: false, error: "Missing product ID." }, { status: 400 });
+    }
+
+    if (!Number.isFinite(surgePercentage) || surgePercentage <= 0 || surgePercentage > 1000) {
+      return json(
+        { success: false, error: "Surge percentage must be between 0.01% and 1000%." },
+        { status: 400 }
+      );
+    }
 
     try {
-      const product = await db.importedProduct.findUnique({
-        where: { id: productId },
-        include: { variants: true },
+      const product = await ensureProductInDb(admin, session, productId);
+
+      if (!product) {
+        return json({ success: false, error: "Product not found." }, { status: 400 });
+      }
+
+      const multiplier = 1 + surgePercentage / 100;
+      const updatedVariantsData: Array<{
+        shopifyVariantId?: string;
+        price: number;
+      }> = [];
+
+      let newProductPrice = 0;
+
+      // Calculate the target state WITHOUT changing the DB.
+      for (const v of product.variants) {
+        const baseVarPrice =
+          v.originalPrice && v.originalPrice > 0
+            ? Number(v.originalPrice)
+            : Number(v.price);
+
+        if (!Number.isFinite(baseVarPrice) || baseVarPrice <= 0) {
+          return json(
+            { success: false, error: `Invalid base price for variant ${v.title || v.id}.` },
+            { status: 400 }
+          );
+        }
+
+        const newVarPrice = Number((baseVarPrice * multiplier).toFixed(2));
+
+        if (newProductPrice === 0) {
+          newProductPrice = newVarPrice;
+        }
+
+        updatedVariantsData.push({
+          shopifyVariantId: v.shopifyVariantId || undefined,
+          price: newVarPrice,
+        });
+      }
+
+      if (updatedVariantsData.length === 0) {
+        return json(
+          { success: false, error: "Product has no variants to surge." },
+          { status: 400 }
+        );
+      }
+
+      // IMPORTANT: Shopify first.
+      // The old code wrote the surged prices to the DB first. If another
+      // catalog-sync process sees that DB state, it can race with Shopify
+      // and overwrite the price. Shopify must succeed before DB is changed.
+      console.log("[Price Surge] Applying to Shopify FIRST:", {
+        shop: session.shop,
+        productId: product.shopifyProductId,
+        surgePercentage,
+        variants: updatedVariantsData,
       });
 
-      if (product) {
-        const multiplier = 1 + surgePercentage / 100;
-        const updatedVariantsData: Array<{ shopifyVariantId?: string; price: number }> = [];
-        let newProductPrice = 0;
+      const syncRes = await syncProductToShopify(
+        admin,
+        product.shopifyProductId,
+        updatedVariantsData
+      );
 
-        for (const v of product.variants) {
-          const baseVarPrice = v.originalPrice && v.originalPrice > 0 ? v.originalPrice : v.price;
-          const newVarPrice = Number((baseVarPrice * multiplier).toFixed(2));
+      if (!syncRes.success) {
+        return json(
+          { success: false, error: `Shopify Sync Failed: ${syncRes.reason}` },
+          { status: 400 }
+        );
+      }
 
-          if (newProductPrice === 0) {
-            newProductPrice = newVarPrice;
-          }
+      // Only now persist the same prices that Shopify confirmed.
+      for (let i = 0; i < product.variants.length; i++) {
+        const v = product.variants[i];
+        const target = updatedVariantsData[i];
 
-          await db.importedVariant.update({
-            where: { id: v.id },
-            data: {
-              price: newVarPrice,
-              originalPrice: baseVarPrice,
-            },
-          });
+        const baseVarPrice =
+          v.originalPrice && v.originalPrice > 0
+            ? Number(v.originalPrice)
+            : Number(v.price);
 
-          updatedVariantsData.push({
-            shopifyVariantId: v.shopifyVariantId || undefined,
-            price: newVarPrice,
-          });
-        }
-
-        if (product.shopifyProductId) {
-          await syncProductToShopify(admin, product.shopifyProductId, updatedVariantsData);
-        }
-
-        await db.importedProduct.update({
-          where: { id: productId },
+        await db.importedVariant.update({
+          where: { id: v.id },
           data: {
-            retailPrice: newProductPrice || product.retailPrice,
-            activeSurgePercentage: surgePercentage,
-            syncStatus: "synced",
+            price: target.price,
+            // Never replace the base price with the surged price.
+            originalPrice: baseVarPrice,
           },
         });
       }
-    } catch (error) {
-      console.error("Failed to apply price surge in DB:", error);
-      return json({ success: false, error: "Failed to apply surge." }, { status: 500 });
+
+      await db.importedProduct.update({
+        where: { id: product.id },
+        data: {
+          retailPrice: newProductPrice || product.retailPrice,
+          activeSurgePercentage: surgePercentage,
+          syncStatus: "synced",
+        },
+      });
+
+      console.log("[Price Surge] DB state saved AFTER Shopify confirmation.");
+    } catch (error: any) {
+      console.error("[Price Surge] Failed:", error);
+
+      return json(
+        { success: false, error: error?.message || "Failed surge." },
+        { status: 500 }
+      );
     }
 
     return json({
@@ -457,29 +652,37 @@ export async function action({ request }: ActionFunctionArgs) {
   if (intent === "removeSurge") {
     const productId = formData.get("productId") as string;
 
+    if (!productId) {
+      return json({ success: false, error: "Missing product ID." }, { status: 400 });
+    }
+
     try {
-      const product = await db.importedProduct.findUnique({
-        where: { id: productId },
-        include: { variants: true },
-      });
+      const product = await ensureProductInDb(admin, session, productId);
 
       if (product) {
-        const resetVariantsData: Array<{ shopifyVariantId?: string; price: number }> = [];
+        const resetVariantsData: Array<{
+          shopifyVariantId?: string;
+          price: number;
+        }> = [];
+
         let resetProductPrice = 0;
 
         for (const v of product.variants) {
-          const baseVarPrice = v.originalPrice && v.originalPrice > 0 ? v.originalPrice : v.price;
+          const baseVarPrice =
+            v.originalPrice && v.originalPrice > 0
+              ? Number(v.originalPrice)
+              : Number(v.price);
+
+          if (!Number.isFinite(baseVarPrice) || baseVarPrice < 0) {
+            return json(
+              { success: false, error: `Invalid original price for variant ${v.title || v.id}.` },
+              { status: 400 }
+            );
+          }
 
           if (resetProductPrice === 0) {
             resetProductPrice = baseVarPrice;
           }
-
-          await db.importedVariant.update({
-            where: { id: v.id },
-            data: {
-              price: baseVarPrice,
-            },
-          });
 
           resetVariantsData.push({
             shopifyVariantId: v.shopifyVariantId || undefined,
@@ -487,12 +690,35 @@ export async function action({ request }: ActionFunctionArgs) {
           });
         }
 
-        if (product.shopifyProductId) {
-          await syncProductToShopify(admin, product.shopifyProductId, resetVariantsData);
+        // Shopify first, then DB.
+        const syncRes = await syncProductToShopify(
+          admin,
+          product.shopifyProductId,
+          resetVariantsData
+        );
+
+        if (!syncRes.success) {
+          return json(
+            { success: false, error: `Reset Failed: ${syncRes.reason}` },
+            { status: 400 }
+          );
+        }
+
+        for (let i = 0; i < product.variants.length; i++) {
+          const v = product.variants[i];
+          const target = resetVariantsData[i];
+
+          await db.importedVariant.update({
+            where: { id: v.id },
+            data: {
+              price: target.price,
+              originalPrice: target.price,
+            },
+          });
         }
 
         await db.importedProduct.update({
-          where: { id: productId },
+          where: { id: product.id },
           data: {
             retailPrice: resetProductPrice || product.retailPrice,
             activeSurgePercentage: 0,
@@ -500,9 +726,13 @@ export async function action({ request }: ActionFunctionArgs) {
           },
         });
       }
-    } catch (error) {
-      console.error("Failed to remove surge in DB:", error);
-      return json({ success: false, error: "Failed to reset surge." }, { status: 500 });
+    } catch (error: any) {
+      console.error("[Price Surge Reset] Failed:", error);
+
+      return json(
+        { success: false, error: error?.message || "Failed reset." },
+        { status: 500 }
+      );
     }
 
     return json({
@@ -513,83 +743,120 @@ export async function action({ request }: ActionFunctionArgs) {
     });
   }
 
-  if (intent === "syncProduct") {
+  if (intent === "updateProduct") {
     const productId = formData.get("productId") as string;
+    const title = formData.get("title") as string;
+    const category = formData.get("category") as string;
+    const variantsRaw = formData.get("variants") as string;
+
+    let variantsData: any[];
 
     try {
-      const product = await db.importedProduct.findUnique({
-        where: { id: productId },
-        include: { variants: true },
-      });
-
-      if (product && product.shopifyProductId) {
-        await syncProductToShopify(
-          admin,
-          product.shopifyProductId,
-          product.variants.map((v) => ({
-            shopifyVariantId: v.shopifyVariantId || undefined,
-            price: v.price,
-          }))
-        );
-      }
-
-      await db.importedProduct.update({
-        where: { id: productId },
-        data: { syncStatus: "synced" },
-      });
-    } catch (error) {
-      console.error("Failed to sync product in DB:", error);
-      return json({ success: false, error: "Failed to sync product." }, { status: 500 });
+      variantsData = JSON.parse(variantsRaw || "[]");
+    } catch {
+      return json({ success: false, error: "Invalid variants data." }, { status: 400 });
     }
 
-    return json({ success: true, syncedProductId: productId });
-  }
-
-  if (intent === "bulkSync") {
-    const productIdsRaw = formData.get("productIds") as string;
-    const productIds: string[] = JSON.parse(productIdsRaw || "[]");
+    if (!Array.isArray(variantsData)) {
+      return json({ success: false, error: "Variants must be an array." }, { status: 400 });
+    }
 
     try {
-      const whereClause =
-        productIds.length > 0
-          ? { id: { in: productIds } }
-          : { shop: session.shop };
+      const product = await ensureProductInDb(admin, session, productId);
 
-      const products = await db.importedProduct.findMany({
-        where: whereClause,
-        include: { variants: true },
-      });
+      if (product) {
+        const primaryVar = variantsData[0];
+        const primaryPrice =
+          primaryVar && Number.isFinite(Number(primaryVar.price))
+            ? Number(primaryVar.price)
+            : product.retailPrice;
 
-      for (const product of products) {
+        const normalizedVariants = variantsData.map((v: any) => ({
+          ...v,
+          price: Number(v.price),
+          originalPrice: Number(v.originalPrice),
+          landedCost: Number(v.landedCost),
+          inventoryQuantity: Number(v.inventoryQuantity),
+        }));
+
+        for (const v of normalizedVariants) {
+          if (
+            !Number.isFinite(v.price) ||
+            v.price < 0 ||
+            !Number.isFinite(v.originalPrice) ||
+            v.originalPrice < 0
+          ) {
+            return json(
+              { success: false, error: "All variant prices must be valid numbers." },
+              { status: 400 }
+            );
+          }
+        }
+
+        // Shopify first. Do not let a failed Shopify update leave the DB
+        // claiming that the catalog was successfully updated.
         if (product.shopifyProductId) {
-          await syncProductToShopify(
+          const syncRes = await syncProductToShopify(
             admin,
             product.shopifyProductId,
-            product.variants.map((v) => ({
-              shopifyVariantId: v.shopifyVariantId || undefined,
+            normalizedVariants.map((v: any) => ({
+              shopifyVariantId: v.shopifyVariantId,
               price: v.price,
             }))
           );
+
+          if (!syncRes.success) {
+            return json(
+              { success: false, error: `Shopify Sync Failed: ${syncRes.reason}` },
+              { status: 400 }
+            );
+          }
+        }
+
+        await db.importedProduct.update({
+          where: { id: product.id },
+          data: {
+            title,
+            category,
+            retailPrice: primaryPrice,
+            syncStatus: "synced",
+          },
+        });
+
+        for (const v of normalizedVariants) {
+          await db.importedVariant.update({
+            where: { id: v.variantId },
+            data: {
+              title: v.name,
+              sku: v.sku,
+              originalPrice: v.originalPrice,
+              price: v.price,
+              landedCost: v.landedCost,
+              stockQuantity: v.inventoryQuantity,
+            },
+          });
         }
       }
+    } catch (error: any) {
+      console.error("[Product Update] Failed:", error);
 
-      await db.importedProduct.updateMany({
-        where: whereClause,
-        data: { syncStatus: "synced" },
-      });
-    } catch (error) {
-      console.error("Failed bulk sync in DB:", error);
-      return json({ success: false, error: "Bulk sync failed." }, { status: 500 });
+      return json(
+        { success: false, error: error?.message || "Failed update." },
+        { status: 500 }
+      );
     }
 
-    return json({ success: true, bulkSynced: true, count: productIds.length });
+    return json({
+      success: true,
+      updatedProductId: productId,
+      actionType: "edited",
+    });
   }
 
   return json({ success: true });
 }
 
 // --- Component ---
-
 export default function ImportedProductsPage() {
   const { importedProducts, query } = useLoaderData<typeof loader>();
   const surgeFetcher = useFetcher<typeof action>();
@@ -600,34 +867,50 @@ export default function ImportedProductsPage() {
   const [productsList, setProductsList] = useState<ImportedProduct[]>(importedProducts);
   const [searchValue, setSearchValue] = useState(query);
   const [sortOption, setSortOption] = useState("retail-desc");
-  const [selectedProductIds, setSelectedProductIds] = useState<string[]>([]);
   const [customSurges, setCustomSurges] = useState<{ [productId: string]: string }>({});
 
-  // Editable Modal States
   const [activeModal, setActiveModal] = useState(false);
   const [selectedProduct, setSelectedProduct] = useState<ImportedProduct | null>(null);
   const [editTitle, setEditTitle] = useState("");
   const [editCategory, setEditCategory] = useState("");
-  const [editVariants, setEditVariants] = useState<ImportedVariant[]>([]);
+  const [editVariants, setEditVariants] = useState<EditableVariantState[]>([]);
 
   useEffect(() => {
     setProductsList(importedProducts);
   }, [importedProducts]);
 
-  const isSaving = editFetcher.state === "submitting" || surgeFetcher.state === "submitting";
+  useEffect(() => {
+    if (surgeFetcher.state === "idle" && surgeFetcher.data) {
+      navigate(".", { replace: true });
+    }
+  }, [surgeFetcher.state, surgeFetcher.data, navigate]);
+
+  const isSaving =
+    editFetcher.state === "submitting" || surgeFetcher.state === "submitting";
 
   const handleOpenManageModal = (product: ImportedProduct) => {
     setSelectedProduct(product);
     setEditTitle(product.title);
     setEditCategory(product.category);
-    setEditVariants(JSON.parse(JSON.stringify(product.variants)));
+    setEditVariants(
+      product.variants.map((v) => ({
+        variantId: v.variantId,
+        shopifyVariantId: v.shopifyVariantId,
+        name: v.name,
+        sku: v.sku || "",
+        originalPrice: String(v.originalPrice ?? v.price ?? 0),
+        price: String(v.price ?? 0),
+        landedCost: String(v.landedCost ?? 0),
+        inventoryQuantity: String(v.inventoryQuantity ?? 0),
+      }))
+    );
     setActiveModal(true);
   };
 
   const handleUpdateVariantField = (
     index: number,
-    field: keyof ImportedVariant,
-    value: any
+    field: keyof EditableVariantState,
+    value: string
   ) => {
     setEditVariants((prev) => {
       const next = [...prev];
@@ -639,35 +922,64 @@ export default function ImportedProductsPage() {
   const handleSaveChanges = () => {
     if (!selectedProduct) return;
 
+    const parsedVariants = editVariants.map((v) => ({
+      variantId: v.variantId,
+      shopifyVariantId: v.shopifyVariantId,
+      name: v.name,
+      sku: v.sku,
+      originalPrice: parseFloat(v.originalPrice) || 0,
+      price: parseFloat(v.price) || 0,
+      landedCost: parseFloat(v.landedCost) || 0,
+      inventoryQuantity: parseInt(v.inventoryQuantity, 10) || 0,
+    }));
+
     editFetcher.submit(
       {
         intent: "updateProduct",
         productId: selectedProduct.id,
         title: editTitle,
         category: editCategory,
-        variants: JSON.stringify(editVariants),
+        variants: JSON.stringify(parsedVariants),
       },
       { method: "POST" }
     );
-
     setActiveModal(false);
   };
 
   const handleApplyForceSurge = (productId: string, percentage: number) => {
     if (isNaN(percentage) || percentage <= 0) return;
 
+    const rawId = productId.replace("gid://shopify/Product/", "");
+    const fullGid = productId.startsWith("gid://shopify/Product/")
+      ? productId
+      : `gid://shopify/Product/${productId}`;
+
     setProductsList((prevProducts) =>
       prevProducts.map((p) => {
-        if (p.id !== productId) return p;
+        const match =
+          p.id === productId ||
+          p.id === fullGid ||
+          p.id === rawId ||
+          p.shopifyProductId === productId ||
+          p.shopifyProductId === fullGid ||
+          p.shopifyProductId === rawId;
 
-        const basePrice = p.originalRetailPrice || p.retailPrice;
+        if (!match) return p;
+
+        const basePrice =
+          p.originalRetailPrice && p.originalRetailPrice > 0
+            ? p.originalRetailPrice
+            : p.retailPrice;
+
         const multiplier = 1 + percentage / 100;
         const newRetail = Number((basePrice * multiplier).toFixed(2));
 
         const updatedVariants = p.variants.map((v) => {
-          const baseVarPrice = v.originalPrice || v.price;
+          const baseVarPrice =
+            v.originalPrice && v.originalPrice > 0 ? v.originalPrice : v.price;
           return {
             ...v,
+            originalPrice: baseVarPrice,
             price: Number((baseVarPrice * multiplier).toFixed(2)),
           };
         });
@@ -675,6 +987,7 @@ export default function ImportedProductsPage() {
         return {
           ...p,
           retailPrice: newRetail,
+          originalRetailPrice: basePrice,
           variants: updatedVariants,
           syncStatus: "pending",
           activeSurgePercentage: percentage,
@@ -685,7 +998,7 @@ export default function ImportedProductsPage() {
     surgeFetcher.submit(
       {
         intent: "forceSurge",
-        productId,
+        productId: fullGid,
         surgePercentage: percentage.toString(),
       },
       { method: "POST" }
@@ -693,12 +1006,24 @@ export default function ImportedProductsPage() {
   };
 
   const handleRemoveSurge = (productId: string) => {
+    const rawId = productId.replace("gid://shopify/Product/", "");
+    const fullGid = productId.startsWith("gid://shopify/Product/")
+      ? productId
+      : `gid://shopify/Product/${productId}`;
+
     setProductsList((prevProducts) =>
       prevProducts.map((p) => {
-        if (p.id !== productId) return p;
+        const match =
+          p.id === productId ||
+          p.id === fullGid ||
+          p.id === rawId ||
+          p.shopifyProductId === productId ||
+          p.shopifyProductId === fullGid ||
+          p.shopifyProductId === rawId;
 
-        const originalRetail = p.originalRetailPrice || p.retailPrice;
+        if (!match) return p;
 
+        const basePrice = p.originalRetailPrice || p.retailPrice;
         const resetVariants = p.variants.map((v) => ({
           ...v,
           price: v.originalPrice || v.price,
@@ -706,7 +1031,7 @@ export default function ImportedProductsPage() {
 
         return {
           ...p,
-          retailPrice: originalRetail,
+          retailPrice: basePrice,
           variants: resetVariants,
           syncStatus: "pending",
           activeSurgePercentage: 0,
@@ -719,7 +1044,7 @@ export default function ImportedProductsPage() {
     surgeFetcher.submit(
       {
         intent: "removeSurge",
-        productId,
+        productId: fullGid,
       },
       { method: "POST" }
     );
@@ -737,8 +1062,14 @@ export default function ImportedProductsPage() {
         return profitB - profitA;
       }
       case "stock-desc": {
-        const totalStockA = a.variants.reduce((acc, v) => acc + (v.inventoryQuantity || 0), 0);
-        const totalStockB = b.variants.reduce((acc, v) => acc + (v.inventoryQuantity || 0), 0);
+        const totalStockA = a.variants.reduce(
+          (acc, v) => acc + (v.inventoryQuantity || 0),
+          0
+        );
+        const totalStockB = b.variants.reduce(
+          (acc, v) => acc + (v.inventoryQuantity || 0),
+          0
+        );
         return totalStockB - totalStockA;
       }
       default:
@@ -746,61 +1077,15 @@ export default function ImportedProductsPage() {
     }
   });
 
-  const handleToggleSelectProduct = (id: string) => {
-    setSelectedProductIds((prev) =>
-      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
-    );
-  };
-
-  const handleSelectAll = () => {
-    if (selectedProductIds.length === sortedProducts.length) {
-      setSelectedProductIds([]);
-    } else {
-      setSelectedProductIds(sortedProducts.map((p) => p.id));
-    }
-  };
-
-  const handleExecuteBulkSync = () => {
-    editFetcher.submit(
-      {
-        intent: "bulkSync",
-        productIds: JSON.stringify(selectedProductIds),
-      },
-      { method: "POST" }
-    );
-  };
-
-  const handleSyncSingleProduct = (productId: string) => {
-    editFetcher.submit(
-      {
-        intent: "syncProduct",
-        productId,
-      },
-      { method: "POST" }
-    );
-  };
-
-  const allSelected =
-    sortedProducts.length > 0 && selectedProductIds.length === sortedProducts.length;
-
   return (
     <Page
       title="Store Catalog & Imported Products"
       subtitle="Edit products, surge prices, and manage catalog items synchronized with your Shopify store."
-      primaryAction={
-        sortedProducts.length > 0
-          ? {
-              content: "Re-sync All Stock",
-              icon: RefreshIcon,
-              onAction: handleExecuteBulkSync,
-            }
-          : undefined
-      }
     >
       <Layout>
         <Layout.Section>
           <BlockStack gap="500">
-            {/* Search & Filter Bar */}
+            {/* Search Bar */}
             <Card>
               <Form method="get" onSubmit={(e) => submit(e.currentTarget)}>
                 <InlineStack gap="300" align="space-between">
@@ -837,55 +1122,31 @@ export default function ImportedProductsPage() {
               </Form>
             </Card>
 
-            {/* Notifications */}
-            {editFetcher.data?.actionType === "edited" && (
-              <Banner tone="success" title="Product Updated Successfully">
-                <p>Product title, category, price, and inventory modifications were saved and pushed to Shopify.</p>
+            {/* Error Banners */}
+            {surgeFetcher.data && !surgeFetcher.data.success && (
+              <Banner tone="critical" title="Surge Execution Error">
+                <p>{(surgeFetcher.data as any).error || "Failed to surge price on Shopify."}</p>
+              </Banner>
+            )}
+            {editFetcher.data && !editFetcher.data.success && (
+              <Banner tone="critical" title="Update Error">
+                <p>{(editFetcher.data as any).error || "Failed to update product."}</p>
               </Banner>
             )}
 
-            {surgeFetcher.data?.success && (
-              <Banner
-                tone={surgeFetcher.data.actionType === "removed" ? "info" : "warning"}
-                title={
-                  surgeFetcher.data.actionType === "removed"
-                    ? "Price Surge Reset"
-                    : "Price Surge Applied"
-                }
-              >
-                <p>
-                  {surgeFetcher.data.actionType === "removed"
-                    ? "Price surge was reset back to original base price."
-                    : `Applied +${surgeFetcher.data.surgePercentage}% price surge to product and synced to Shopify.`}
-                </p>
+            {/* Success Banners */}
+            {surgeFetcher.data?.success && surgeFetcher.data.actionType === "applied" && (
+              <Banner tone="warning" title="Price Surge Applied">
+                <p>{`Applied +${surgeFetcher.data.surgePercentage}% price surge to product and synced to Shopify.`}</p>
+              </Banner>
+            )}
+            {surgeFetcher.data?.success && surgeFetcher.data.actionType === "removed" && (
+              <Banner tone="info" title="Price Surge Reset">
+                <p>Restored product to original catalog price.</p>
               </Banner>
             )}
 
-            {/* Bulk Actions Controls */}
-            {sortedProducts.length > 0 && (
-              <Card padding="300">
-                <InlineStack align="space-between" blockAlign="center">
-                  <InlineStack gap="300" blockAlign="center">
-                    <Checkbox
-                      label={`Select All (${selectedProductIds.length}/${sortedProducts.length} Items)`}
-                      checked={allSelected}
-                      onChange={handleSelectAll}
-                    />
-                  </InlineStack>
-                  <Button
-                    variant="primary"
-                    icon={RefreshIcon}
-                    disabled={selectedProductIds.length === 0 || isSaving}
-                    loading={isSaving}
-                    onClick={handleExecuteBulkSync}
-                  >
-                    {`Re-sync Selected (${selectedProductIds.length})`}
-                  </Button>
-                </InlineStack>
-              </Card>
-            )}
-
-            {/* Empty State */}
+            {/* Product Grid */}
             {sortedProducts.length === 0 ? (
               <Card>
                 <EmptyState
@@ -897,30 +1158,12 @@ export default function ImportedProductsPage() {
                   }}
                   image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
                 >
-                  <p>
-                    {searchValue
-                      ? `No products matched your search "${searchValue}". Try clearing filters.`
-                      : "No products were found in your Shopify store or imported database."}
-                  </p>
+                  <p>No inventory items match your current filter.</p>
                 </EmptyState>
               </Card>
             ) : (
-              /* Product Grid */
               <Grid>
                 {sortedProducts.map((product) => {
-                  const totalStock = product.variants.reduce(
-                    (acc, v) => acc + (v.inventoryQuantity || 0),
-                    0
-                  );
-                  const isSelected = selectedProductIds.includes(product.id);
-
-                  // Calculated Profit Metrics
-                  const unitProfit = product.retailPrice - product.landedCost;
-                  const profitMargin =
-                    product.retailPrice > 0
-                      ? ((unitProfit / product.retailPrice) * 100).toFixed(1)
-                      : "0.0";
-
                   const currentCustomVal = customSurges[product.id] || "";
                   const hasActiveSurge = Boolean(
                     product.activeSurgePercentage && product.activeSurgePercentage > 0
@@ -933,7 +1176,7 @@ export default function ImportedProductsPage() {
                     >
                       <Card padding="0">
                         <BlockStack gap="0">
-                          {/* Image Container with Badges Overlay */}
+                          {/* Image Box */}
                           <div
                             style={{
                               position: "relative",
@@ -944,47 +1187,18 @@ export default function ImportedProductsPage() {
                               display: "flex",
                               alignItems: "center",
                               justifyContent: "center",
-                              borderTopLeftRadius: "8px",
-                              borderTopRightRadius: "8px",
                             }}
                           >
                             <img
                               src={product.image}
                               alt={product.title}
-                              style={{
-                                width: "100%",
-                                height: "100%",
-                                objectFit: "cover",
-                              }}
+                              style={{ width: "100%", height: "100%", objectFit: "cover" }}
                             />
-
-                            {/* Select Checkbox */}
-                            <div
-                              style={{
-                                position: "absolute",
-                                top: "10px",
-                                left: "10px",
-                                zIndex: 3,
-                                background: "rgba(255, 255, 255, 0.9)",
-                                borderRadius: "4px",
-                                padding: "2px 6px",
-                              }}
-                            >
-                              <Checkbox
-                                label=""
-                                labelHidden
-                                checked={isSelected}
-                                onChange={() => handleToggleSelectProduct(product.id)}
-                              />
-                            </div>
-
-                            {/* Status & Surge Badges */}
                             <div
                               style={{
                                 position: "absolute",
                                 top: "10px",
                                 right: "10px",
-                                zIndex: 3,
                                 display: "flex",
                                 flexDirection: "column",
                                 gap: "4px",
@@ -994,7 +1208,6 @@ export default function ImportedProductsPage() {
                               <Badge tone={product.syncStatus === "synced" ? "success" : "attention"}>
                                 {product.syncStatus.toUpperCase()}
                               </Badge>
-
                               {hasActiveSurge && (
                                 <Badge tone="warning">
                                   {`+${product.activeSurgePercentage}% SURGE`}
@@ -1003,7 +1216,7 @@ export default function ImportedProductsPage() {
                             </div>
                           </div>
 
-                          {/* Details & Actions */}
+                          {/* Card Content */}
                           <Box padding="400">
                             <BlockStack gap="300">
                               <BlockStack gap="100">
@@ -1014,103 +1227,79 @@ export default function ImportedProductsPage() {
                                   {product.category} • SKU: {product.sku}
                                 </Text>
                               </BlockStack>
-
                               <Divider />
-
                               <InlineStack align="space-between" blockAlign="center">
                                 <BlockStack gap="050">
-                                  <Text variant="bodyXs" tone="subdued" as="span">
-                                    Retail Price
-                                  </Text>
+                                  <Text variant="bodyXs" tone="subdued" as="span">Retail Price:</Text>
                                   <Text variant="bodyMd" fontWeight="bold" as="span">
                                     ${product.retailPrice.toFixed(2)}
                                   </Text>
                                 </BlockStack>
-
                                 <BlockStack gap="050">
-                                  <Text variant="bodyXs" tone="subdued" as="span">
-                                    Landed Cost
-                                  </Text>
+                                  <Text variant="bodyXs" tone="subdued" as="span">Landed Cost:</Text>
                                   <Text variant="bodyMd" tone="subdued" as="span">
                                     ${product.landedCost.toFixed(2)}
                                   </Text>
                                 </BlockStack>
-
-                                <BlockStack gap="050">
-                                  <Text variant="bodyXs" tone="subdued" as="span">
-                                    Stock
-                                  </Text>
-                                  <Badge tone={totalStock > 0 ? "info" : "critical"}>
-                                    {`${totalStock} units`}
-                                  </Badge>
-                                </BlockStack>
                               </InlineStack>
 
-                              <Box background="bg-surface-secondary" padding="200" borderRadius="100">
-                                <InlineStack align="space-between">
-                                  <Text variant="bodyXs" tone="subdued" as="span">
-                                    Margin: {profitMargin}%
-                                  </Text>
-                                  <Text variant="bodyXs" fontWeight="bold" tone="success" as="span">
-                                    +${unitProfit.toFixed(2)} / item
-                                  </Text>
-                                </InlineStack>
-                              </Box>
+                              <Divider />
 
-                              {/* Surge Price Control */}
-                              <InlineStack gap="200" blockAlign="center">
-                                <div style={{ width: "90px" }}>
-                                  <TextField
-                                    label=""
-                                    labelHidden
-                                    type="number"
-                                    placeholder="%"
-                                    value={currentCustomVal}
-                                    onChange={(val) =>
-                                      setCustomSurges((prev) => ({ ...prev, [product.id]: val }))
-                                    }
-                                    autoComplete="off"
-                                  />
-                                </div>
-                                <Button
-                                  size="micro"
-                                  variant="secondary"
-                                  onClick={() =>
-                                    handleApplyForceSurge(
-                                      product.id,
-                                      parseFloat(currentCustomVal)
-                                    )
-                                  }
-                                >
-                                  Surge
-                                </Button>
-                                {hasActiveSurge && (
+                              {/* Surge Buttons */}
+                              <BlockStack gap="150">
+                                <Text variant="bodyXs" fontWeight="bold" as="span">
+                                  Price Surge Controls
+                                </Text>
+                                <InlineStack gap="100">
+                                  <Button size="micro" onClick={() => handleApplyForceSurge(product.id, 10)}>
+                                    +10%
+                                  </Button>
+                                  <Button size="micro" onClick={() => handleApplyForceSurge(product.id, 20)}>
+                                    +20%
+                                  </Button>
+                                  <Button size="micro" onClick={() => handleApplyForceSurge(product.id, 30)}>
+                                    +30%
+                                  </Button>
+                                </InlineStack>
+                                <InlineStack gap="200" blockAlign="center">
+                                  <div style={{ flexGrow: 1 }}>
+                                    <TextField
+                                      label=""
+                                      labelHidden
+                                      type="number"
+                                      placeholder="Custom %"
+                                      value={currentCustomVal}
+                                      onChange={(val) =>
+                                        setCustomSurges((prev) => ({ ...prev, [product.id]: val }))
+                                      }
+                                      autoComplete="off"
+                                    />
+                                  </div>
                                   <Button
                                     size="micro"
-                                    tone="critical"
-                                    variant="plain"
-                                    onClick={() => handleRemoveSurge(product.id)}
+                                    variant="secondary"
+                                    onClick={() =>
+                                      handleApplyForceSurge(product.id, parseFloat(currentCustomVal))
+                                    }
                                   >
-                                    Reset
+                                    Apply
                                   </Button>
-                                )}
-                              </InlineStack>
+                                  {hasActiveSurge && (
+                                    <Button
+                                      size="micro"
+                                      tone="critical"
+                                      variant="plain"
+                                      onClick={() => handleRemoveSurge(product.id)}
+                                    >
+                                      Reset
+                                    </Button>
+                                  )}
+                                </InlineStack>
+                              </BlockStack>
 
-                              {/* Action Buttons */}
-                              <InlineStack gap="200" align="space-between">
-                                <Button
-                                  icon={EditIcon}
-                                  onClick={() => handleOpenManageModal(product)}
-                                >
-                                  Edit Product
-                                </Button>
-                                <Button
-                                  icon={RefreshIcon}
-                                  onClick={() => handleSyncSingleProduct(product.id)}
-                                >
-                                  Sync
-                                </Button>
-                              </InlineStack>
+                              <Button icon={EditIcon} onClick={() => handleOpenManageModal(product)}>
+                                Edit Details
+                              </Button>
                             </BlockStack>
                           </Box>
                         </BlockStack>
@@ -1124,7 +1313,7 @@ export default function ImportedProductsPage() {
         </Layout.Section>
       </Layout>
 
-      {/* Edit Product Modal */}
+      {/* Edit Modal */}
       {selectedProduct && (
         <Modal
           open={activeModal}
@@ -1144,81 +1333,26 @@ export default function ImportedProductsPage() {
         >
           <Modal.Section>
             <BlockStack gap="400">
-              <TextField
-                label="Product Title"
-                value={editTitle}
-                onChange={setEditTitle}
-                autoComplete="off"
-              />
-              <TextField
-                label="Category / Product Type"
-                value={editCategory}
-                onChange={setEditCategory}
-                autoComplete="off"
-              />
-
+              <TextField label="Product Title" value={editTitle} onChange={setEditTitle} autoComplete="off" />
+              <TextField label="Category" value={editCategory} onChange={setEditCategory} autoComplete="off" />
               <Divider />
-
-              <Text variant="headingSm" as="h4">
-                Variants & Inventory
-              </Text>
-
+              <Text variant="headingSm" as="h4">Variants & Inventory</Text>
               {editVariants.map((variant, idx) => (
-                <Box
-                  key={variant.variantId || idx}
-                  padding="300"
-                  background="bg-surface-secondary"
-                  borderRadius="200"
-                >
+                <Box key={variant.variantId || idx} padding="300" background="bg-surface-secondary" borderRadius="200">
                   <BlockStack gap="300">
-                    <Text variant="bodyMd" fontWeight="bold" as="p">
-                      Variant {idx + 1}: {variant.name}
-                    </Text>
+                    <Text variant="bodyMd" fontWeight="bold" as="p">Variant {idx + 1}: {variant.name}</Text>
                     <Grid>
                       <Grid.Cell columnSpan={{ xs: 6, sm: 3, md: 3, lg: 3, xl: 3 }}>
-                        <TextField
-                          label="SKU"
-                          value={variant.sku}
-                          onChange={(v) => handleUpdateVariantField(idx, "sku", v)}
-                          autoComplete="off"
-                        />
+                        <TextField label="SKU" value={variant.sku} onChange={(v) => handleUpdateVariantField(idx, "sku", v)} autoComplete="off" />
                       </Grid.Cell>
                       <Grid.Cell columnSpan={{ xs: 6, sm: 3, md: 3, lg: 3, xl: 3 }}>
-                        <TextField
-                          label="Retail Price ($)"
-                          type="number"
-                          value={variant.price.toString()}
-                          onChange={(v) =>
-                            handleUpdateVariantField(idx, "price", parseFloat(v) || 0)
-                          }
-                          autoComplete="off"
-                        />
+                        <TextField label="Retail Price ($)" type="number" value={variant.price} onChange={(v) => handleUpdateVariantField(idx, "price", v)} autoComplete="off" />
                       </Grid.Cell>
                       <Grid.Cell columnSpan={{ xs: 6, sm: 3, md: 3, lg: 3, xl: 3 }}>
-                        <TextField
-                          label="Landed Cost ($)"
-                          type="number"
-                          value={variant.landedCost.toString()}
-                          onChange={(v) =>
-                            handleUpdateVariantField(idx, "landedCost", parseFloat(v) || 0)
-                          }
-                          autoComplete="off"
-                        />
+                        <TextField label="Landed Cost ($)" type="number" value={variant.landedCost} onChange={(v) => handleUpdateVariantField(idx, "landedCost", v)} autoComplete="off" />
                       </Grid.Cell>
                       <Grid.Cell columnSpan={{ xs: 6, sm: 3, md: 3, lg: 3, xl: 3 }}>
-                        <TextField
-                          label="Stock Quantity"
-                          type="number"
-                          value={variant.inventoryQuantity.toString()}
-                          onChange={(v) =>
-                            handleUpdateVariantField(
-                              idx,
-                              "inventoryQuantity",
-                              parseInt(v, 10) || 0
-                            )
-                          }
-                          autoComplete="off"
-                        />
+                        <TextField label="Stock Quantity" type="number" value={variant.inventoryQuantity} onChange={(v) => handleUpdateVariantField(idx, "inventoryQuantity", v)} autoComplete="off" />
                       </Grid.Cell>
                     </Grid>
                   </BlockStack>

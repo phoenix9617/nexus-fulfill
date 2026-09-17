@@ -12,17 +12,17 @@ dev_store_url = "nexusfulfill.myshopify.com"
 [webhooks]
 api_version = "2026-07"
 
-[[webhooks.subscriptions]]
-uri = "/webhooks/orders/create"
-topics = [ "orders/create" ]
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/orders/create"
+  topics = [ "orders/create" ]
 
-[[webhooks.subscriptions]]
-uri = "/webhooks/products/create"
-topics = [ "products/create" ]
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled" ]
 
-[[webhooks.subscriptions]]
-uri = "/webhooks/app/uninstalled"
-topics = [ "app/uninstalled" ]
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/products/create"
+  topics = [ "products/create" ]
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
