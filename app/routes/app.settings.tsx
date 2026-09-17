@@ -1,7 +1,7 @@
 // app/routes/app.settings.tsx
 
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { useLoaderData, useActionData, useSubmit, useNavigation } from "react-router";
+import { useLoaderData, useActionData, useSubmit, useNavigation, useRouteError, isRouteErrorResponse } from "react-router";
 import { useState, useCallback, useEffect } from "react";
 import {
   Page,
@@ -21,43 +21,53 @@ import { TitleBar } from "@shopify/app-bridge-react";
 import db from "../db.server";
 import { authenticate } from "../shopify.server";
 
-// Normalizes shop string regardless of session prefix
 const cleanShop = (s: string) => s.replace(/^offline_/, "");
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const rawShop = session.shop || "";
+  const rawShop = session?.shop || "";
   const shop = cleanShop(rawShop);
 
-  let settings = await db.appSettings.findFirst({
-    where: {
-      shop: { contains: shop },
-    },
-  });
+  let settings = null;
+  let surgeSetting = null;
 
-  if (!settings) {
-    settings = await db.appSettings.create({
-      data: {
-        shop,
+  try {
+    settings = await db.appSettings.findFirst({
+      where: {
+        shop: { contains: shop },
       },
     });
+
+    if (!settings && shop) {
+      settings = await db.appSettings.create({
+        data: {
+          shop,
+        },
+      });
+    }
+  } catch (err) {
+    console.error("[Settings Loader] Error fetching AppSettings:", err);
   }
 
-  const surgeSetting = await db.surgeSetting.findFirst({
-    where: {
-      shop: { contains: shop },
-    },
-  });
+  try {
+    surgeSetting = await db.surgeSetting.findFirst({
+      where: {
+        shop: { contains: shop },
+      },
+    });
+  } catch (err) {
+    console.error("[Settings Loader] Error fetching SurgeSetting:", err);
+  }
 
   return Response.json({
     settings: {
-      cjEmail: settings.cjEmail || "",
-      cjApiKey: settings.cjApiKey || "",
-      rapidApiKey: settings.rapidApiKey || "",
-      aliExpressToken: settings.aliExpressToken || "",
-      failoverEnabled: settings.failoverEnabled ?? true,
-      marginThreshold: settings.marginThreshold ?? 15,
-      priceStrategy: settings.priceStrategy || "auto_adjust",
+      cjEmail: settings?.cjEmail || "",
+      cjApiKey: settings?.cjApiKey || "",
+      rapidApiKey: settings?.rapidApiKey || "",
+      aliExpressToken: settings?.aliExpressToken || "",
+      failoverEnabled: settings?.failoverEnabled ?? true,
+      marginThreshold: settings?.marginThreshold ?? 15,
+      priceStrategy: settings?.priceStrategy || "auto_adjust",
       cronSecret: process.env.CRON_SECRET || "",
     },
     surgeSetting: {
@@ -71,11 +81,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const rawShop = session.shop || "";
+  const rawShop = session?.shop || "";
   const shop = cleanShop(rawShop);
   const formData = await request.formData();
 
-  // App Settings Inputs
   const cjEmail = String(formData.get("cjEmail") || "").trim();
   const cjApiKey = String(formData.get("cjApiKey") || "").trim();
   const rapidApiKey = String(formData.get("rapidApiKey") || "").trim();
@@ -84,13 +93,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const marginThreshold = parseFloat(String(formData.get("marginThreshold") || "15"));
   const priceStrategy = String(formData.get("priceStrategy") || "auto_adjust");
 
-  // Surge Settings Inputs
   const surgeIsEnabled = formData.get("surgeIsEnabled") === "true";
   const autoSalesThreshold = parseInt(String(formData.get("autoSalesThreshold") || "10"), 10);
   const autoSurgePercentage = parseFloat(String(formData.get("autoSurgePercentage") || "10.0"));
   const autoResetDays = parseInt(String(formData.get("autoResetDays") || "7"), 10);
 
-  // Validation
   if (isNaN(marginThreshold) || marginThreshold < 0) {
     return Response.json(
       { success: false, error: "Margin threshold must be a valid non-negative number." },
@@ -113,7 +120,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   try {
-    // 1. Update App Settings
     await db.appSettings.upsert({
       where: { shop },
       update: {
@@ -137,7 +143,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       },
     });
 
-    // 2. Update Surge Settings
     await db.surgeSetting.upsert({
       where: { shop },
       update: {
@@ -170,7 +175,6 @@ export default function SettingsPage() {
   const navigation = useNavigation();
   const isSaving = navigation.state === "submitting";
 
-  // Supplier & Security State
   const [cjEmail, setCjEmail] = useState(settings.cjEmail);
   const [cjApiKey, setCjApiKey] = useState(settings.cjApiKey);
   const [rapidApiKey, setRapidApiKey] = useState(settings.rapidApiKey || settings.aliExpressToken);
@@ -179,7 +183,6 @@ export default function SettingsPage() {
   const [marginThreshold, setMarginThreshold] = useState(String(settings.marginThreshold));
   const [priceStrategy, setPriceStrategy] = useState(settings.priceStrategy);
 
-  // Dynamic Surge Engine State
   const [surgeIsEnabled, setSurgeIsEnabled] = useState(surgeSetting.isEnabled);
   const [autoSalesThreshold, setAutoSalesThreshold] = useState(String(surgeSetting.autoSalesThreshold));
   const [autoSurgePercentage, setAutoSurgePercentage] = useState(String(surgeSetting.autoSurgePercentage));
@@ -252,7 +255,6 @@ export default function SettingsPage() {
         )}
 
         <Layout>
-          {/* Supplier API Integrations */}
           <Layout.Section>
             <Card padding="500">
               <BlockStack gap="400">
@@ -296,7 +298,6 @@ export default function SettingsPage() {
             </Card>
           </Layout.Section>
 
-          {/* Dynamic Failover & Margin Rules */}
           <Layout.Section>
             <Card padding="500">
               <BlockStack gap="400">
@@ -336,7 +337,6 @@ export default function SettingsPage() {
             </Card>
           </Layout.Section>
 
-          {/* Auto-Surge Pricing Engine Defaults */}
           <Layout.Section>
             <Card padding="500">
               <BlockStack gap="400">
@@ -391,7 +391,6 @@ export default function SettingsPage() {
             </Card>
           </Layout.Section>
 
-          {/* Background Cron Security */}
           <Layout.Section>
             <Card padding="500">
               <BlockStack gap="400">
@@ -415,7 +414,6 @@ export default function SettingsPage() {
             </Card>
           </Layout.Section>
 
-          {/* Action Footer */}
           <Layout.Section>
             <InlineStack align="end">
               <Button
@@ -430,6 +428,27 @@ export default function SettingsPage() {
           </Layout.Section>
         </Layout>
       </BlockStack>
+    </Page>
+  );
+}
+
+export function ErrorBoundary() {
+  const error = useRouteError();
+  let errorMessage = "An unknown error occurred while loading settings.";
+
+  if (isRouteErrorResponse(error)) {
+    errorMessage = `${error.status} ${error.statusText}: ${JSON.stringify(error.data)}`;
+  } else if (error instanceof Error) {
+    errorMessage = error.message;
+  }
+
+  return (
+    <Page>
+      <TitleBar title="Settings Error" />
+      <Banner title="Settings Failed to Load" tone="critical">
+        <p><strong>Error details:</strong> {errorMessage}</p>
+        <p style={{ marginTop: "8px" }}>Check the database connection or verify your model schemas.</p>
+      </Banner>
     </Page>
   );
 }
